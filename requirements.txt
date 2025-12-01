@@ -1,0 +1,17 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+
+# Tokenization
+tiktoken>=0.5.0
+
+# Model evaluation and profiling
+thop>=0.1.1
+
+# Data handling
+datasets>=2.14.0
+tqdm>=4.65.0
+requests>=2.31.0
+
+# Optional: Logging and experiment tracking
+wandb>=0.15.0

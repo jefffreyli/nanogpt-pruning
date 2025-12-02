@@ -1,20 +1,23 @@
-# config for training GPT-2 (124M) down to very nice loss of ~2.85 on 1 node of 8X A100 40GB
-# launch as the following (e.g. in a screen session) and wait ~5 days:
+
 # $ torchrun --standalone --nproc_per_node=8 train.py config/train_gpt2.py
 
 wandb_log = True
-wandb_project = 'owt'
-wandb_run_name='gpt2-124M'
+wandb_project = 'wikitext2'
+wandb_run_name= 'gpt2-124M-wt2'
 
-# these make the total batch size be ~0.5M
-# 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-batch_size = 12
-block_size = 1024
-gradient_accumulation_steps = 5 * 8
+dataset = 'wikitext2'       # looks in data/wikitext2/
+out_dir = 'out-wikitext2'   # where checkpoints/logs will go
 
-# this makes total number of tokens be 300B
-max_iters = 600000
-lr_decay_iters = 600000
+
+# these make a reasonable total batch size for 1 GPU
+# 4 batch size * 512 block size * 8 gradaccum * 1 GPU = 16,384 tokens per update
+batch_size = 4
+block_size = 512
+gradient_accumulation_steps = 8
+
+# this makes total number of tokens be
+max_iters = 100000
+lr_decay_iters = 100000
 
 # eval stuff
 eval_interval = 1000

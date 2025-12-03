@@ -166,6 +166,21 @@ class GPT(nn.Module):
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        
+
+        # === TR-BERT-style token policies ===
+        #if not using token reduction, model is exactly like gpt-2
+        #else, some layers have policy nets attached (4,8)
+        self.use_token_reduction = config.use_token_reduction
+        self.reduction_layers = list(config.reduction_layers)
+        self.policies = nn.ModuleDict()
+        if self.use_token_reduction:
+            for layer_idx in self.reduction_layers:
+                self.policies[str(layer_idx)] = TokenPolicy(
+                    config.n_embd,
+                    config.policy_hidden_dim
+                )
+
 
         # init all weights
         self.apply(self._init_weights)
@@ -197,30 +212,101 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None,
+                #additions to gpt-2
+                use_token_reduction=None, policy_training=False
+                ):
+        
+        if use_token_reduction is None:
+            use_token_reduction = self.use_token_reduction
+
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        
+
+        #want to check which tokens go through
+        alive = torch.ones(b, t, dtype=torch.bool, device=device)
+
+        policy_logprobs = [] #list of (B,) tensors
+        num_selected_tokens = [] #list of (B,) tensors
+
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+
+
+
+        for layer_idx, block in enumerate(self.transformer.h):
+
+            prev_x = x
+            x_new = block(prev_x)  # standard transformer block
+
+            if use_token_reduction and str(layer_idx) in self.policies:
+                policy = self.policies[str(layer_idx)]
+                probs = policy(prev_x)  # (B, T), p(select)
+
+                if policy_training and self.training:
+                    # Sample Bernoulli actions
+                    actions = torch.bernoulli(probs).bool()  # (B, T)
+                    # Always keep last token to preserve causal LM
+                    actions[:, -1] = True
+
+                    # Once dead, always dead
+                    actions = alive & actions
+
+                    # log π(a|s) = sum over tokens
+                    log_p = (
+                        actions.float() * torch.log(probs + 1e-8) +
+                        (1.0 - actions.float()) * torch.log(1.0 - probs + 1e-8)
+                    )  # (B, T)
+                    policy_logprobs.append(log_p.sum(dim=1))  # (B,)
+                else:
+                    # deterministic thresholding for eval
+                    actions = (probs > 0.5)
+                    actions[:, -1] = True
+                    actions = alive & actions
+
+                alive = actions
+                num_selected_tokens.append(alive.float().sum(dim=1))  # (B,)
+
+                # Freeze skipped tokens: keep their old representation
+                mask = alive.unsqueeze(-1)  # (B, T, 1)
+                x = torch.where(mask, x_new, prev_x)
+            else:
+                x = x_new
+
         x = self.transformer.ln_f(x)
+
+
+
+
+
+
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            lm_loss  = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+            lm_loss  = None
 
-        return logits, loss
+        rl_info = {
+    "policy_logprobs": policy_logprobs,        # list[(B,)]
+    "num_selected_tokens": num_selected_tokens # list[(B,)]
+}
+
+        # For compatibility, keep the old 2-return form when not doing RL
+        if not use_token_reduction:
+            return logits, lm_loss
+
+        # When using token reduction, return RL info as well
+        return logits, lm_loss, rl_info
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

@@ -208,7 +208,7 @@ class GPT(nn.Module):
         if targets is not None:
             logits = self.lm_head(x)
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            
+
             if self.config.use_token_pruning and self.training and len(pruning_info) > 0:
                 sparsity_loss = self.compute_sparsity_loss(pruning_info)
                 loss = ce_loss + self.config.lambda_sparsity * sparsity_loss
@@ -221,11 +221,11 @@ class GPT(nn.Module):
         if return_pruning_info:
             return logits, loss, pruning_info
         return logits, loss
-    
+
     def compute_sparsity_loss(self, pruning_info):
         """
         L1 regularization on pruning masks to encourage sparsity
-        
+
         Args:
             pruning_info: list of dicts from each layer
         Returns:
@@ -233,13 +233,13 @@ class GPT(nn.Module):
         """
         sparsity_loss = 0.0
         num_layers = 0
-        
+
         for stats in pruning_info:
             if stats['pruning_mask'] is not None:
                 # L1 norm of mask (encourages values close to 0)
                 sparsity_loss += stats['pruning_mask'].sum()
                 num_layers += 1
-        
+
         if num_layers > 0:
             # Normalize by number of elements
             total_elements = sum(
@@ -248,7 +248,7 @@ class GPT(nn.Module):
                 if stats['pruning_mask'] is not None
             )
             sparsity_loss = sparsity_loss / total_elements
-        
+
         return sparsity_loss
 
     def crop_block_size(self, block_size):
@@ -307,7 +307,7 @@ class GPT(nn.Module):
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
+                # speecial treatment for the Conv1D weights we need to transpose
                 assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k].t())
@@ -390,8 +390,8 @@ class GPT(nn.Module):
 
 # Modification: Additional classes to compute token importance scores and LTP block
 class TokenImportanceScorer(nn.Module):
-    """ 
-    Compute token importance score by getting mean of attention weights 
+    """
+    Compute token importance score by getting mean of attention weights
     """
     def compute_importance_score(self, attention_weights):
         """
@@ -402,47 +402,47 @@ class TokenImportanceScorer(nn.Module):
         """
         if attention_weights is None:
             return None
-            
+
         # Average over heads: (B, n_head, T, T) -> (B, T, T)
         avg_attention_over_heads = attention_weights.mean(dim=1)
-        
+
         # Column mean: how much attention each token receives
         # (B, T, T) -> (B, T)
         importance_scores = avg_attention_over_heads.mean(dim=1)
-        
+
         return importance_scores
 
 # Modification of Block class
 class LTPBlock(nn.Module):
     """Transformer block with Learned Token Pruning"""
-    
+
     def __init__(self, config, layer_id, use_pruning=True):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
-        
+
         self.use_pruning = use_pruning
         self.layer_id = layer_id
-        
+
         if use_pruning:
             # Learnable threshold parameter
             self.threshold = nn.Parameter(torch.tensor(0.1))
-            
+
             # Token importance scorer
             self.importance_scorer = TokenImportanceScorer()
-            
+
             # Temperature for soft pruning (hyperparameter)
             self.temperature = config.pruning_temperature  # e.g., 0.01
-            
+
             # Training mode: soft or hard pruning
             self.use_soft_pruning = True  # Toggle during training stages
-    
+
     def compute_soft_mask(self, importance_scores):
         """
         Differentiable soft mask using sigmoid
-        
+
         Args:
             importance_scores: (B, T)
         Returns:
@@ -450,11 +450,11 @@ class LTPBlock(nn.Module):
         """
         soft_mask = torch.sigmoid((importance_scores - self.threshold) / self.temperature)
         return soft_mask
-    
+
     def compute_hard_mask(self, importance_scores):
         """
         Binary hard mask for inference
-        
+
         Args:
             importance_scores: (B, T)
         Returns:
@@ -462,7 +462,7 @@ class LTPBlock(nn.Module):
         """
         hard_mask = (importance_scores > self.threshold).float()
         return hard_mask
-    
+
     def forward(self, x, return_pruning_info=False):
         """
         Args:
@@ -471,42 +471,42 @@ class LTPBlock(nn.Module):
             x: (B, T, C) - with pruned tokens masked
         """
         B, T, C = x.size()
-        
+
         # Attention with weights
         if self.use_pruning:
             attn_out, attn_weights = self.attn(self.ln_1(x), return_attention=True)
         else:
             attn_out = self.attn(self.ln_1(x))
             attn_weights = None
-        
+
         x = x + attn_out
-        
+
         # Apply pruning
         pruning_mask = None
         importance_scores = None
         tokens_kept_ratio = 1.0
-        
+
         if self.use_pruning and attn_weights is not None:
             # Compute importance scores
             importance_scores = self.importance_scorer.compute_importance_score(
                 attn_weights
             )
-            
+
             # Compute mask (soft during training, hard during eval)
             if self.training and self.use_soft_pruning:
                 pruning_mask = self.compute_soft_mask(importance_scores)
             else:
                 pruning_mask = self.compute_hard_mask(importance_scores)
-            
+
             # Apply mask to output (element-wise multiply)
             # Shape: (B, T, C) * (B, T, 1) -> (B, T, C)
             x = x * pruning_mask.unsqueeze(-1)
-            
+
             tokens_kept_ratio = pruning_mask.sum() / pruning_mask.numel()
-        
+
         # MLP
         x = x + self.mlp(self.ln_2(x))
-        
+
         # Modification: used for regularization loss computation
         if return_pruning_info:
             return x, {

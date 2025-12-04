@@ -15,3 +15,11 @@ requests>=2.31.0
 
 # Optional: Logging and experiment tracking
 wandb>=0.15.0
+
+#need to install transformers
+transformers
+
+##### I used these versions of pytorch for training:
+# torch --index-url https://download.pytorch.org/whl/cu128
+# torchvision --index-url https://download.pytorch.org/whl/cu128
+# torchaudio --index-url https://download.pytorch.org/whl/cu128

@@ -180,27 +180,31 @@ if init_from == 'scratch':
     model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
-    # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
-    # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
     unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
+    for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if master_process:
+        print("Missing keys when loading:", missing)
+        print("Unexpected keys when loading:", unexpected)
+
+    if use_token_reduction and rl_stage:
+        # RL phase: new run on top of baseline weights
+        iter_num = 0
+        best_val_loss = 1e9
+    else:
+        # normal resume (e.g., baseline training)
+        iter_num = checkpoint['iter_num']
+        best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -215,12 +219,26 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
+raw_model = model  # the non-DDP model
+
+if use_token_reduction and rl_stage:
+    print("RL stage: freezing GPT weights, training only token policies.")
+    for name, p in raw_model.named_parameters():
+        if name.startswith("policies."):
+            p.requires_grad = True
+        else:
+            p.requires_grad = False
+
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
+# optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = raw_model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+
+# Only reuse optimizer state for *baseline* or normal training.
+# For RL stage (different param set), start with a fresh optimizer.
+if init_from == 'resume' and not (use_token_reduction and rl_stage):
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
@@ -262,31 +280,44 @@ def compute_total_loss(lm_loss, rl_info, seq_len, raw_model):
     seq_len: T = X.size(1)
     raw_model: underlying GPT (not DDP wrapper), to access config
     """
-    policy_logprobs = rl_info["policy_logprobs"]       # list of (B,)
+    policy_logprobs = rl_info["policy_logprobs"]        # list of (B,)
     num_selected_tokens = rl_info["num_selected_tokens"]  # list of (B,)
 
     # If there were no reduction layers (or none fired), just use LM loss
     if len(policy_logprobs) == 0:
-        return lm_loss
+        return lm_loss, None
 
-    # Stack over reduction layers: shape (num_layers, B) -> (B,)
-    logp_total = torch.stack(policy_logprobs).sum(dim=0)         # (B,)
-    selected_total = torch.stack(num_selected_tokens).sum(dim=0) # (B,)
+    # Stack over reduction layers: shape (L, B)
+    logp = torch.stack(policy_logprobs, dim=0)           # (L, B)
+    selected = torch.stack(num_selected_tokens, dim=0)   # (L, B)
 
-    # Hyperparams (prefer from config if present)
-    lam = getattr(raw_model.config, "lambda_tokens", lambda_tokens)
-    alpha = getattr(raw_model.config, "rl_weight", rl_weight)
+    L = logp.size(0)
     T = seq_len
 
+    # average log-prob per decision instead of raw sum
+    logp_total = logp.sum(dim=0) / (L * T)              # (B,)
+
+    # average fraction of tokens selected across layers
+    frac_selected = selected.sum(dim=0) / (L * T)       # (B,)
+    avg_frac = frac_selected.mean().item()              # scalar for logging
+
+    # Hyperparams
+    lam = getattr(raw_model.config, "lambda_tokens", lambda_tokens)
+    alpha = getattr(raw_model.config, "rl_weight", rl_weight)
+
     # Reward: larger is better
-    # R = -LM_loss - λ * (fraction of selected tokens)
-    reward = -lm_loss.detach() - lam * (selected_total / T)  # (B,)
+    with torch.no_grad():
+        base = -lm_loss.detach()
+        base = base.expand_as(frac_selected)           # (B,)
+        reward = base - lam * frac_selected            # (B,)
+        reward = reward - reward.mean()                # advantage baseline
 
     # REINFORCE: maximize E[R], so minimize -R * log π
     policy_loss = -(reward * logp_total).mean()
 
     total_loss = lm_loss + alpha * policy_loss
-    return total_loss
+    return total_loss, avg_frac
+
 
 
 # learning rate decay scheduler (cosine with warmup)
@@ -349,6 +380,9 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
+    avg_frac = None
+
+
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
@@ -366,8 +400,13 @@ while True:
                     use_token_reduction=True,
                     policy_training=True,
                 )
-                total_loss = compute_total_loss(lm_loss, rl_info, X.size(1), raw_model)
+                total_loss, avg_frac_step = compute_total_loss(lm_loss, rl_info, X.size(1), raw_model)
+                
+                 # just keep the last micro-step's avg_frac for logging
+                avg_frac = avg_frac_step
                 loss = total_loss / gradient_accumulation_steps
+
+                
             else:
                 # baseline / normal LM training
                 logits, loss = model(X, Y)
@@ -376,6 +415,7 @@ while True:
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
+
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
@@ -397,9 +437,20 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if use_token_reduction and rl_stage and avg_frac is not None:
+            print(
+                f"iter {iter_num}: loss {lossf:.4f}, kept_frac ~ {avg_frac:.3f}, "
+                f"time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
+            )
+        else:
+            print(
+                f"iter {iter_num}: loss {lossf:.4f}, "
+                f"time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
+            )
     iter_num += 1
     local_iter_num += 1
+
+
 
     # termination conditions
     if iter_num > max_iters:

@@ -17,10 +17,10 @@ block_size = 512
 gradient_accumulation_steps = 8
 
 n_layer = 12
-n_head  = 12
-n_embd  = 768
+n_head = 12
+n_embd = 768
 dropout = 0.0
-bias    = True
+bias = True
 
 max_iters = 500          # fewer steps for RL fine-tuning
 learning_rate = 1e-4     # smaller LR for policy + slight LM tuning

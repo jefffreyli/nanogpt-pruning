@@ -21,10 +21,10 @@ gradient_accumulation_steps = 8  # 8*8*512 ≈ 32k tokens/iter
 
 # model size (matches gpt2 small)
 n_layer = 12
-n_head  = 12
-n_embd  = 768
+n_head = 12
+n_embd = 768
 dropout = 0.0
-bias    = True
+bias = True
 
 # train length / lr
 max_iters = 1000

@@ -83,21 +83,7 @@ class EvaluationMetrics:
         with torch.no_grad():
             for batch in dataloader:
                 # Handle different dataloader formats
-                if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-                    # If dataloader returns (input, target) tuple
-                    input_ids, targets = batch[0], batch[1]
-                else:
-                    # If dataloader returns only input, create targets by shifting
-                    # For sequence [t0, t1, t2, ..., tn-1], targets are [t1, t2, ..., tn-1]
-                    # We use input_ids[:-1] and targets = input_ids[1:] to maintain same length
-                    input_ids = batch if not isinstance(
-                        batch, (list, tuple)) else batch[0]
-                    if input_ids.size(1) > 1:
-                        targets = input_ids[:, 1:]
-                        input_ids = input_ids[:, :-1]
-                    else:
-                        # If sequence length is 1, we can't create targets, skip this batch
-                        continue
+                input_ids, targets = batch
 
                 # Forward pass to get logits
                 logits, _ = self.model(input_ids, targets)

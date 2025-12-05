@@ -3,7 +3,7 @@
 
 wandb_log = True
 wandb_project = 'wikitext2'
-wandb_run_name= 'gpt2-124M-wt2'
+wandb_run_name = 'gpt2-124M-wt2'
 
 dataset = 'wikitext2'       # looks in data/wikitext2/
 out_dir = 'out-wikitext2'   # where checkpoints/logs will go

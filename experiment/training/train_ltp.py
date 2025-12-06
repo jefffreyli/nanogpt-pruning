@@ -182,7 +182,7 @@ elif init_from == 'resume':
     if master_process:
         print(f"Resuming training from {out_dir}")
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
@@ -203,7 +203,7 @@ elif init_from == 'pretrained':
     if master_process:
         print(
             f"Loading pretrained model from {pretrained_path} and adding LTP")
-    checkpoint = torch.load(pretrained_path, map_location='cpu')
+    checkpoint = torch.load(pretrained_path, map_location=device)
 
     # Get vocab size and config from checkpoint
     ckpt_config = checkpoint['config']

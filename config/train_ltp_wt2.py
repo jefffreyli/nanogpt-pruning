@@ -35,6 +35,9 @@ bias = True
 use_token_pruning = True
 pruning_temperature = 0.01  # Temperature for soft pruning mask
 lambda_sparsity = 0.1       # Sparsity regularization weight
+# Importance scoring method for causal attention
+# Options: 'naive_col' (original, biased), 'row', 'causal_col' (recommended), 'future_aware'
+importance_method = 'causal_col'
 
 # train length / lr
 max_iters = 1000

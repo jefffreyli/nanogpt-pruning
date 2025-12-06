@@ -1,61 +1,199 @@
+"""
+Evaluation script to measure FLOPs and perplexity for different GPT model variants:
+1. Baseline GPT model
+2. LTP (Learned Token Pruning) model
+3. Dynamic Token Reduction model (TR-BERT style with RL)
+"""
+
 import torch
 import sys
 import os
 
 # Add parent directory to path to allow imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from experiment.models.dynamic_token_reduction_model import GPT, GPTConfig
-from experiment.models.ltp_model import GPTWithLTP, GPTWithLTPConfig
 from experiment.evaluation.evaluation_metrics import EvaluationMetrics
+from experiment.models.dynamic_token_reduction_model import GPT as DynamicTRGPT, GPTConfig as DynamicTRGPTConfig
+from experiment.models.ltp_model import GPTWithLTP, GPTWithLTPConfig
+from model import GPT as BaselineGPT, GPTConfig as BaselineGPTConfig
 
-# Load baseline pretrained model checkpoint
-checkpoint_path = './experiment/models/baseline_ckpt.pt'
-print(f"Loading baseline checkpoint from {checkpoint_path}")
-checkpoint = torch.load(checkpoint_path, map_location='cpu')
+# Import models and configs
 
-# Extract config from checkpoint
-ckpt_config = checkpoint['config']
 
-# Get vocab size from checkpoint (GPT-2 uses 50257, not padded 50304)
-vocab_size = checkpoint['model']['transformer.wte.weight'].shape[0]
+def evaluate_baseline_model():
+    """Evaluate the baseline GPT model (no token reduction)."""
+    print("=" * 60)
+    print("BASELINE GPT MODEL")
+    print("=" * 60)
 
-# Create Dynamic Token Reduction model configuration from checkpoint config
-config = GPTConfig(
-    vocab_size=vocab_size,  # Match checkpoint vocab size
-    block_size=ckpt_config['block_size'],
-    n_layer=ckpt_config['n_layer'],
-    n_head=ckpt_config['n_head'],
-    n_embd=ckpt_config['n_embd'],
-    dropout=ckpt_config['dropout'],
-    bias=ckpt_config['bias'],
-    use_token_reduction=True,  # Enable dynamic token reduction
-    reduction_layers=(4, 8),   # Apply token reduction at layers 4 and 8
-    policy_hidden_dim=256,
-    lambda_tokens=1e-4,
-    rl_weight=0.1,
-)
+    # Create baseline config (small model for testing)
+    config = BaselineGPTConfig(
+        vocab_size=50304,
+        block_size=256,
+        n_layer=6,
+        n_head=6,
+        n_embd=384,
+        dropout=0.0,
+        bias=True
+    )
 
-# Initialize model with pretrained weights
-print("Creating Dynamic Token Reduction model...")
-dynamic_token_reduction_model = GPT(config)
+    # Create evaluator with baseline model
+    evaluator = EvaluationMetrics(config=config, Model=BaselineGPT)
 
-# Load the pretrained weights (strict=False allows new policy parameters)
-result = dynamic_token_reduction_model.load_state_dict(
-    checkpoint['model'], strict=False)
-print(f"Loaded {len(dynamic_token_reduction_model.state_dict()) - len(result.missing_keys)} pretrained parameters")
-print(f"Initialized {len(result.missing_keys)} new policy parameters")
-if result.missing_keys:
+    print("\n--- FLOPs Measurement ---")
+    macs, params = evaluator.measure_flop_count()
+
+    print("\n--- Perplexity Measurement ---")
+    loss, perplexity = evaluator.measure_perplexity()
+
+    return {
+        'evaluator': evaluator,
+        'macs': macs,
+        'params': params,
+        'loss': loss,
+        'perplexity': perplexity
+    }
+
+
+def evaluate_ltp_model(use_token_pruning=False):
+    """Evaluate the LTP (Learned Token Pruning) model."""
+    print("\n" + "=" * 60)
+    pruning_status = "WITH" if use_token_pruning else "WITHOUT"
+    print(f"LTP MODEL ({pruning_status} TOKEN PRUNING)")
+    print("=" * 60)
+
+    # Create LTP config
+    config = GPTWithLTPConfig(
+        vocab_size=50304,
+        block_size=256,
+        n_layer=6,
+        n_head=6,
+        n_embd=384,
+        dropout=0.0,
+        bias=True,
+        use_token_pruning=use_token_pruning,
+        pruning_temperature=0.01,
+        lambda_sparsity=0.1
+    )
+
+    # Create evaluator with LTP model
+    evaluator = EvaluationMetrics(config=config, Model=GPTWithLTP)
+
+    print("\n--- FLOPs Measurement ---")
+    macs, params = evaluator.measure_flop_count()
+
+    print("\n--- Perplexity Measurement ---")
+    loss, perplexity = evaluator.measure_perplexity()
+
+    return {
+        'evaluator': evaluator,
+        'macs': macs,
+        'params': params,
+        'loss': loss,
+        'perplexity': perplexity
+    }
+
+
+def evaluate_dynamic_tr_model(use_token_reduction=False):
+    """Evaluate the Dynamic Token Reduction model (TR-BERT style with RL)."""
+    print("\n" + "=" * 60)
+    reduction_status = "WITH" if use_token_reduction else "WITHOUT"
     print(
-        f"New parameters: {[k for k in result.missing_keys if 'policies' in k]}")
+        f"DYNAMIC TOKEN REDUCTION MODEL ({reduction_status} TOKEN REDUCTION)")
+    print("=" * 60)
 
-print(f"Loaded pretrained weights (iter: {checkpoint.get('iter_num', 'unknown')}, "
-      f"val_loss: {checkpoint.get('best_val_loss', 'unknown'):.4f})")
-dynamic_token_reduction_model.eval()
+    # Create Dynamic TR config
+    config = DynamicTRGPTConfig(
+        vocab_size=50304,
+        block_size=256,
+        n_layer=6,
+        n_head=6,
+        n_embd=384,
+        dropout=0.0,
+        bias=True,
+        use_token_reduction=use_token_reduction,
+        reduction_layers=(2, 4),  # Apply token reduction at layers 2 and 4
+        policy_hidden_dim=256,
+        lambda_tokens=1e-4,
+        rl_weight=0.1
+    )
 
-# Measure FLOPs
-print("\nMeasuring FLOPs for Dynamic Token Reduction model...")
-ltp_model_evaluator = EvaluationMetrics(config=config, Model=GPTWithLTP)
-baseline_evaluator = EvaluationMetrics()
-ltp_model_evaluator.measure_flop_count()
-baseline_evaluator.measure_flop_count()
+    # Create evaluator with Dynamic TR model
+    evaluator = EvaluationMetrics(config=config, Model=DynamicTRGPT)
+
+    print("\n--- FLOPs Measurement ---")
+    macs, params = evaluator.measure_flop_count()
+
+    print("\n--- Perplexity Measurement ---")
+    loss, perplexity = evaluator.measure_perplexity()
+
+    return {
+        'evaluator': evaluator,
+        'macs': macs,
+        'params': params,
+        'loss': loss,
+        'perplexity': perplexity
+    }
+
+
+def compare_all_models():
+    """Run comparison of all model variants."""
+    print("\n" + "#" * 60)
+    print("# MODEL COMPARISON: FLOPs AND PERPLEXITY")
+    print("#" * 60 + "\n")
+
+    results = {}
+
+    # 1. Baseline model
+    results['baseline'] = evaluate_baseline_model()
+
+    # 2. LTP model without pruning (should be similar to baseline)
+    results['ltp_no_pruning'] = evaluate_ltp_model(use_token_pruning=False)
+
+    # 3. LTP model with pruning enabled
+    results['ltp_with_pruning'] = evaluate_ltp_model(use_token_pruning=True)
+
+    # 4. Dynamic TR model without reduction (should be similar to baseline)
+    results['dynamic_tr_no_reduction'] = evaluate_dynamic_tr_model(
+        use_token_reduction=False)
+
+    # 5. Dynamic TR model with reduction enabled
+    results['dynamic_tr_with_reduction'] = evaluate_dynamic_tr_model(
+        use_token_reduction=True)
+
+    # Print summary comparison table
+    print("\n" + "#" * 60)
+    print("# SUMMARY COMPARISON TABLE")
+    print("#" * 60)
+
+    baseline_macs = results['baseline']['macs']
+
+    print(f"\n{'Model':<40} {'MACs':<15} {'Params':<12} {'Perplexity':<12} {'MACs vs Baseline':<15}")
+    print("-" * 94)
+
+    model_names = {
+        'baseline': 'Baseline GPT',
+        'ltp_no_pruning': 'LTP (no pruning)',
+        'ltp_with_pruning': 'LTP (with pruning)',
+        'dynamic_tr_no_reduction': 'Dynamic TR (no reduction)',
+        'dynamic_tr_with_reduction': 'Dynamic TR (with reduction)'
+    }
+
+    for key, name in model_names.items():
+        r = results[key]
+        macs_ratio = r['macs'] / baseline_macs * 100
+        print(
+            f"{name:<40} {r['macs']:<15.2e} {r['params']:<12.2e} {r['perplexity']:<12.2f} {macs_ratio:>6.1f}%")
+
+    print("\n" + "#" * 60)
+    print("# COMPARISON COMPLETE")
+    print("#" * 60)
+
+    return results
+
+
+if __name__ == "__main__":
+    # Set random seed for reproducibility
+    torch.manual_seed(42)
+
+    # Run comparison
+    results = compare_all_models()

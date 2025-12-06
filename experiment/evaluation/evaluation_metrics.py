@@ -33,6 +33,8 @@ class EvaluationMetrics:
         print(f"FLOPs (MACs): {macs}")
         print(f"Parameters: {params}")
 
+        return macs, params
+
     def measure_perplexity(self):
         """
         Measure the perplexity of a given model
@@ -49,13 +51,24 @@ class EvaluationMetrics:
 
         # Forward pass with targets to get loss
         with torch.no_grad():
-            logits, loss = self.model(dummy_input, dummy_targets)
+            result = self.model(dummy_input, dummy_targets)
+            # Handle different model return signatures:
+            # - Baseline GPT: (logits, loss)
+            # - LTP model: (logits, loss) or (logits, loss, pruning_info)
+            # - Dynamic TR model: (logits, loss) or (logits, loss, rl_info)
+            if isinstance(result, tuple):
+                logits = result[0]
+                loss = result[1]
+            else:
+                raise ValueError("Model output format not recognized")
 
         # Perplexity is exp(cross_entropy_loss)
         perplexity = torch.exp(loss)
 
         print(f"Cross-entropy loss: {loss.item():.4f}")
         print(f"Perplexity: {perplexity.item():.4f}")
+
+        return loss.item(), perplexity.item()
 
     def measure_training_time(self):
         pass

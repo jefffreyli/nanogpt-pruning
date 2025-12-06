@@ -144,6 +144,9 @@ class GPTWithLTPConfig:
     use_token_pruning: bool = False
     pruning_temperature: float = 0.01  # Temperature for soft pruning
     lambda_sparsity: float = 0.1  # Sparsity regularization weight
+    # Importance scoring method for causal attention
+    # Options: 'naive_col' (original), 'row', 'causal_col', 'future_aware'
+    importance_method: str = 'causal_col'
 
 # Modification: Use Block or LTPBlock based on config
 
@@ -467,25 +470,79 @@ class GPTWithLTP(nn.Module):
 
 class TokenImportanceScorer(nn.Module):
     """
-    Compute token importance score by getting mean of attention weights
+    Compute token importance scores from attention weights.
+
+    For causal/decoder attention (GPT), the naive column-average approach is biased
+    because later tokens can only be "voted on" by fewer tokens due to causal masking.
+
+    This class provides multiple scoring methods to address this bias:
+    - naive_col: Original column mean (biased for causal attention)
+    - row: Row mean - how much each token attends outward
+    - causal_col: Column sum normalized by actual number of voters
+    - future_aware: Position-weighted attention (later positions weighted higher)
     """
+
+    def __init__(self, method: str = 'causal_col'):
+        super().__init__()
+        self.method = method
+        valid_methods = {'naive_col', 'row', 'causal_col', 'future_aware'}
+        if method not in valid_methods:
+            raise ValueError(
+                f"Unknown importance method: {method}. Valid options: {valid_methods}")
 
     def compute_importance_score(self, attention_weights):
         """
+        Compute token importance scores using the configured method.
+
         Args:
-            attention_weights: attention matrix (B, n_head, T, T)
+            attention_weights: attention matrix (B, n_head, T, T) with causal mask applied
         Returns:
             importance_scores: (B, T)
         """
         if attention_weights is None:
             return None
 
-        # Average over heads: (B, n_head, T, T) -> (B, T, T)
-        avg_attention_over_heads = attention_weights.mean(dim=1)
+        B, n_head, T, T_kv = attention_weights.shape
 
-        # Column mean: how much attention each token receives
-        # (B, T, T) -> (B, T)
-        importance_scores = avg_attention_over_heads.mean(dim=1)
+        # Average over heads: (B, n_head, T, T) -> (B, T, T)
+        avg_attention = attention_weights.mean(dim=1)
+
+        if self.method == 'naive_col':
+            # Original: Column mean - how much attention each token receives
+            # BIASED for causal attention: early tokens get more votes
+            # (B, T, T) -> (B, T)
+            importance_scores = avg_attention.mean(dim=1)
+
+        elif self.method == 'row':
+            # Row mean: How much each token attends to others
+            # In causal attention, token i attends to positions 0..i
+            # Later tokens attend to more positions, so normalize
+            importance_scores = avg_attention.mean(dim=-1)  # (B, T)
+
+        elif self.method == 'causal_col':
+            # Column sum normalized by number of voters per position
+            # In causal attention, position i can only be attended to by positions i..T-1
+            # So position 0 gets T votes, position 1 gets T-1 votes, ..., position T-1 gets 1 vote
+            # (B, T) - sum of attention each token receives
+            attention_received = avg_attention.sum(dim=1)
+            # Number of tokens that can vote for each position: [T, T-1, T-2, ..., 1]
+            num_voters = torch.arange(
+                T, 0, -1, device=attention_weights.device, dtype=attention_weights.dtype)
+            importance_scores = attention_received / \
+                num_voters.unsqueeze(0)  # (B, T)
+
+        elif self.method == 'future_aware':
+            # Weight attention by the position of the attending token
+            # Later tokens (which see more context) have higher weight
+            position_weights = torch.arange(
+                1, T + 1, device=attention_weights.device, dtype=attention_weights.dtype)
+            position_weights = position_weights.view(
+                1, T, 1)  # (1, T, 1) for broadcasting
+            # Weight each row by position of the attending token
+            weighted_attention = avg_attention * position_weights  # (B, T, T)
+            # Sum weighted attention received by each token, normalize by total weight
+            importance_scores = weighted_attention.sum(
+                dim=1) / position_weights.sum()  # (B, T)
 
         return importance_scores
 
@@ -521,8 +578,11 @@ class LTPBlock(nn.Module):
                 threshold_init = expected_importance * 0.5
             self.threshold = nn.Parameter(torch.tensor(threshold_init))
 
-            # Token importance scorer
-            self.importance_scorer = TokenImportanceScorer()
+            # Token importance scorer with causal-aware method
+            importance_method = getattr(
+                config, 'importance_method', 'causal_col')
+            self.importance_scorer = TokenImportanceScorer(
+                method=importance_method)
 
             # Temperature for soft pruning (hyperparameter)
             self.temperature = config.pruning_temperature  # e.g., 0.01

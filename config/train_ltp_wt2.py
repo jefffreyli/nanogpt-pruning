@@ -38,7 +38,7 @@ lambda_sparsity = 0.1       # Sparsity regularization weight
 
 # train length / lr
 max_iters = 1000
-learning_rate = 3e-4
+learning_rate = 1e-4
 weight_decay = 0.1
 
 # warmup and decay

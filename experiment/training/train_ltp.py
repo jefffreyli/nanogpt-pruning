@@ -5,6 +5,7 @@ Usage:
     python experiment/training/train_ltp.py config/train_ltp_wt2.py
 """
 
+from experiment.models.ltp_model import GPTWithLTP, GPTWithLTPConfig
 import os
 import sys
 import time
@@ -19,7 +20,6 @@ from torch.distributed import init_process_group, destroy_process_group
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from experiment.models.ltp_model import GPTWithLTP, GPTWithLTPConfig
 
 
 # I/O
@@ -266,9 +266,6 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
-        sparsity_losses = torch.zeros(
-            eval_iters) if use_token_pruning else None
-        ce_losses = torch.zeros(eval_iters)
 
         for k in range(eval_iters):
             X, Y = get_batch(split)
@@ -276,21 +273,87 @@ def estimate_loss():
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
 
-            # Track individual loss components if using pruning
-            if use_token_pruning and hasattr(model, 'module'):
-                # In DDP, access underlying model
-                raw_model = model.module
-            else:
-                raw_model = model
-
         out[split] = losses.mean()
-        out[f'{split}_ce'] = ce_losses.mean(
-        ) if use_token_pruning else losses.mean()
-        if use_token_pruning and sparsity_losses is not None:
-            out[f'{split}_sparsity'] = sparsity_losses.mean()
 
     model.train()
     return out
+
+
+@torch.no_grad()
+def get_pruning_stats():
+    """Get pruning statistics for each layer."""
+    if not use_token_pruning:
+        return None
+
+    model.eval()
+
+    # Get underlying model (handle DDP wrapper)
+    if hasattr(model, 'module'):
+        raw_model = model.module
+    else:
+        raw_model = model
+
+    # Run a single batch to get pruning info
+    X, Y = get_batch('val')
+    with ctx:
+        logits, loss, pruning_info = raw_model(X, Y, return_pruning_info=True)
+
+    stats = {
+        'layer_stats': [],
+        'total_tokens_kept': 0.0,
+        'total_tokens': 0.0,
+    }
+
+    for layer_idx, layer_info in enumerate(pruning_info):
+        if layer_info['pruning_mask'] is not None:
+            kept_ratio = layer_info['tokens_kept_ratio']
+            if isinstance(kept_ratio, torch.Tensor):
+                kept_ratio = kept_ratio.item()
+            threshold = layer_info['threshold']
+
+            stats['layer_stats'].append({
+                'layer': layer_idx,
+                'kept_ratio': kept_ratio,
+                'pruned_ratio': 1.0 - kept_ratio,
+                'threshold': threshold,
+            })
+            stats['total_tokens_kept'] += kept_ratio
+            stats['total_tokens'] += 1.0
+
+    if stats['total_tokens'] > 0:
+        stats['avg_kept_ratio'] = stats['total_tokens_kept'] / \
+            stats['total_tokens']
+        stats['avg_pruned_ratio'] = 1.0 - stats['avg_kept_ratio']
+    else:
+        stats['avg_kept_ratio'] = 1.0
+        stats['avg_pruned_ratio'] = 0.0
+
+    model.train()
+    return stats
+
+
+def print_pruning_stats(stats):
+    """Print pruning statistics in a formatted table."""
+    if stats is None:
+        return
+
+    print("\n" + "="*60)
+    print("Token Pruning Statistics per Layer")
+    print("="*60)
+    print(f"{'Layer':<8} {'Kept %':<12} {'Pruned %':<12} {'Threshold':<12}")
+    print("-"*60)
+
+    for layer_stat in stats['layer_stats']:
+        print(f"{layer_stat['layer']:<8} "
+              f"{layer_stat['kept_ratio']*100:>6.2f}%     "
+              f"{layer_stat['pruned_ratio']*100:>6.2f}%     "
+              f"{layer_stat['threshold']:.6f}")
+
+    print("-"*60)
+    print(f"{'AVERAGE':<8} "
+          f"{stats['avg_kept_ratio']*100:>6.2f}%     "
+          f"{stats['avg_pruned_ratio']*100:>6.2f}%")
+    print("="*60 + "\n")
 
 # Learning rate scheduler
 
@@ -337,9 +400,10 @@ while True:
         print(
             f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-        if use_token_pruning and 'train_sparsity' in losses:
-            print(
-                f"  train ce: {losses['train_ce']:.4f}, sparsity: {losses['train_sparsity']:.4f}")
+        # Print pruning statistics if token pruning is enabled
+        if use_token_pruning:
+            pruning_stats = get_pruning_stats()
+            print_pruning_stats(pruning_stats)
 
         if wandb_log:
             log_dict = {
@@ -349,11 +413,15 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu * 100,
             }
-            if use_token_pruning:
+            if use_token_pruning and pruning_stats:
                 log_dict.update({
-                    "train/ce_loss": losses.get('train_ce', 0),
-                    "train/sparsity_loss": losses.get('train_sparsity', 0),
+                    "pruning/avg_kept_ratio": pruning_stats['avg_kept_ratio'],
+                    "pruning/avg_pruned_ratio": pruning_stats['avg_pruned_ratio'],
                 })
+                # Log per-layer stats
+                for layer_stat in pruning_stats['layer_stats']:
+                    log_dict[f"pruning/layer_{layer_stat['layer']}_kept"] = layer_stat['kept_ratio']
+                    log_dict[f"pruning/layer_{layer_stat['layer']}_threshold"] = layer_stat['threshold']
             wandb.log(log_dict)
 
         if losses['val'] < best_val_loss or always_save_checkpoint:

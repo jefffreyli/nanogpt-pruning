@@ -233,29 +233,6 @@ elif init_from == 'pretrained':
             print(
                 f"New parameters: {[k for k in result.missing_keys if 'threshold' in k]}")
 
-    # Freeze all pretrained weights, only train new threshold parameters
-    if master_process:
-        print("Freezing all pretrained weights...")
-
-    frozen_params = 0
-    trainable_params = 0
-
-    for name, param in model.named_parameters():
-        if 'threshold' in name:
-            # Keep threshold parameters trainable
-            param.requires_grad = True
-            trainable_params += 1
-            if master_process:
-                print(f"  Trainable: {name}")
-        else:
-            # Freeze all other parameters
-            param.requires_grad = False
-            frozen_params += 1
-
-    if master_process:
-        print(
-            f"Frozen {frozen_params} parameters, training {trainable_params} threshold parameters")
-
 model.to(device)
 
 # Initialize GradScaler for mixed precision training

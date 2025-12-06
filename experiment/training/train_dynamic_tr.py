@@ -17,6 +17,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 
 import os
+import sys
 import time
 import math
 import pickle
@@ -27,8 +28,11 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
 # from model import GPTConfig, GPT
-from experiment.dynamic_token_reduction_model import GPTConfig, GPT
+from experiment.models.dynamic_token_reduction_model import GPTConfig, GPT
 
 
 

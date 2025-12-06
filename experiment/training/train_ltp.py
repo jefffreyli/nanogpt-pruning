@@ -5,7 +5,6 @@ Usage:
     python experiment/training/train_ltp.py config/train_ltp_wt2.py
 """
 
-from experiment.models.ltp_model import GPTWithLTP, GPTWithLTPConfig
 import os
 import sys
 import time
@@ -20,6 +19,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from experiment.models.ltp_model import GPTWithLTP, GPTWithLTPConfig
 
 # I/O
 out_dir = 'out-ltp'

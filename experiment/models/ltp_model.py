@@ -479,14 +479,19 @@ class LTPBlock(nn.Module):
         self.layer_id = layer_id
 
         if use_pruning:
-            # Learnable threshold parameter - initialize with layer-dependent values
-            # Linearly increasing from layer 0 to layer n_layer-1
-            # Layer 0: ~0.01, Layer n_layer-1: ~0.1 (allows progressive pruning)
+            # Learnable threshold parameter - initialize based on expected importance scores
+            # For causal attention, average importance ≈ 1/block_size
+            # Initialize thresholds below this to keep most tokens initially
+            expected_importance = 1.0 / config.block_size  # e.g., ~0.002 for T=512
+
             if config.n_layer > 1:
-                threshold_init = 0.01 + \
-                    (layer_id / (config.n_layer - 1)) * (0.1 - 0.01)
+                # Layer 0: 50% of expected (keep most tokens)
+                # Layer n_layer-1: 100% of expected (prune around average)
+                layer_ratio = layer_id / (config.n_layer - 1)
+                threshold_init = expected_importance * \
+                    (0.5 + layer_ratio * 0.5)
             else:
-                threshold_init = 0.01
+                threshold_init = expected_importance * 0.5
             self.threshold = nn.Parameter(torch.tensor(threshold_init))
 
             # Token importance scorer

@@ -257,26 +257,26 @@ class GPTWithLTP(nn.Module):
 
     def compute_sparsity_loss(self, pruning_info):
         """
-        L1 regularization on pruning masks to encourage sparsity
-        Per Equation 12: L_reg = (1/L) * sum(||M^(l)||_1)
+        L1 regularization on pruning masks to encourage sparsity.
+        Returns the average proportion of tokens kept across all layers.
 
         Args:
             pruning_info: list of dicts from each layer
         Returns:
-            sparsity_loss: scalar tensor
+            sparsity_loss: scalar tensor in [0, 1]
         """
-        sparsity_loss = 0.0
-        num_layers = 0
+        total_mask_sum = 0.0
+        total_elements = 0
 
         for stats in pruning_info:
             if stats['pruning_mask'] is not None:
-                # L1 norm of mask (encourages values close to 0)
-                sparsity_loss += stats['pruning_mask'].sum()
-                num_layers += 1
+                total_mask_sum += stats['pruning_mask'].sum()
+                total_elements += stats['pruning_mask'].numel()
 
-        if num_layers > 0:
-            # Normalize by number of layers L (per paper Equation 12)
-            sparsity_loss = sparsity_loss / num_layers
+        if total_elements > 0:
+            sparsity_loss = total_mask_sum / total_elements
+        else:
+            sparsity_loss = torch.tensor(0.0)
 
         return sparsity_loss
 

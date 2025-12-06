@@ -13,7 +13,7 @@ class EvaluationMetrics:
         """
         if config is None:
             config = GPTConfig(vocab_size=65, block_size=256,
-                               n_layer=6, n_head=6, n_embd=384, dropout=0.2)
+                               n_layer=12, n_head=12, n_embd=384, dropout=0.2)
         self.config = config
         self.model = Model(self.config)
 

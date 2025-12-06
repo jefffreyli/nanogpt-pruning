@@ -2,7 +2,7 @@
 Full training loop for LTP model with Learned Token Pruning.
 
 Usage:
-$ python experiment/training/train_ltp.py
+    python experiment/training/train_ltp.py config/train_ltp_wt2.py
 """
 
 import os
@@ -22,8 +22,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from experiment.models.ltp_model import GPTWithLTP, GPTWithLTPConfig
 
 
-# -----------------------------------------------------------------------------
-# Configuration - you can override these via command line
 # I/O
 out_dir = 'out-ltp'
 eval_interval = 500
@@ -41,7 +39,7 @@ wandb_run_name = 'ltp-run-' + str(time.time())
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 4
-batch_size = 32
+batch_size = 12
 block_size = 256
 
 # model - GPT2 small-ish config
@@ -71,7 +69,7 @@ lr_decay_iters = 10000
 min_lr = 3e-5
 
 # system
-device = 'cuda'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 dtype = 'bfloat16' if torch.cuda.is_available(
 ) and torch.cuda.is_bf16_supported() else 'float16'
 compile = False  # torch.compile not always compatible with custom models
@@ -184,7 +182,7 @@ elif init_from == 'resume':
     if master_process:
         print(f"Resuming training from {out_dir}")
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load(ckpt_path, map_location='cpu')
     checkpoint_model_args = checkpoint['model_args']
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
@@ -198,6 +196,65 @@ elif init_from == 'resume':
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+elif init_from == 'pretrained':
+    # Load from a pretrained checkpoint (e.g., baseline_ckpt.pt)
+    # and add LTP pruning capabilities
+    pretrained_path = 'experiment/models/baseline_ckpt.pt'
+    if master_process:
+        print(
+            f"Loading pretrained model from {pretrained_path} and adding LTP")
+    checkpoint = torch.load(pretrained_path, map_location='cpu')
+
+    # Get vocab size and config from checkpoint
+    ckpt_config = checkpoint['config']
+    vocab_size = checkpoint['model']['transformer.wte.weight'].shape[0]
+
+    # Update model_args with checkpoint values
+    model_args.update({
+        'vocab_size': vocab_size,
+        'n_layer': ckpt_config['n_layer'],
+        'n_head': ckpt_config['n_head'],
+        'n_embd': ckpt_config['n_embd'],
+        'block_size': ckpt_config['block_size'],
+        'bias': ckpt_config['bias'],
+    })
+
+    # Create LTP model with pruning enabled
+    gptconf = GPTWithLTPConfig(**model_args)
+    model = GPTWithLTP(gptconf)
+
+    # Load pretrained weights (strict=False allows new pruning params)
+    result = model.load_state_dict(checkpoint['model'], strict=False)
+    if master_process:
+        print(
+            f"Loaded {len(model.state_dict()) - len(result.missing_keys)} pretrained parameters")
+        print(f"Initialized {len(result.missing_keys)} new pruning parameters")
+        if result.missing_keys:
+            print(
+                f"New parameters: {[k for k in result.missing_keys if 'threshold' in k]}")
+
+    # Freeze all pretrained weights, only train new threshold parameters
+    if master_process:
+        print("Freezing all pretrained weights...")
+
+    frozen_params = 0
+    trainable_params = 0
+
+    for name, param in model.named_parameters():
+        if 'threshold' in name:
+            # Keep threshold parameters trainable
+            param.requires_grad = True
+            trainable_params += 1
+            if master_process:
+                print(f"  Trainable: {name}")
+        else:
+            # Freeze all other parameters
+            param.requires_grad = False
+            frozen_params += 1
+
+    if master_process:
+        print(
+            f"Frozen {frozen_params} parameters, training {trainable_params} threshold parameters")
 
 model.to(device)
 

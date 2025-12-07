@@ -19,11 +19,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 # Import the LTP model
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from experiment.models.ltp_model import GPTLTP, GPTConfigLTP
 
 # I/O
 out_dir = 'out-ltp'
-eval_interval = 500
+eval_interval = 100
 log_interval = 10
 eval_iters = 100
 eval_only = False
@@ -50,7 +51,7 @@ bias = False
 
 # LTP-specific parameters
 # Set prune_mode='learned' to enable token pruning
-prune_mode = 'none'  # 'learned' to enable pruning, 'none' to disable
+prune_mode = 'learned'  # 'learned' to enable pruning, 'none' to disable
 # Threshold for the final layer (higher = more pruning)
 final_token_threshold = 0.01
 temperature = 5.0  # Temperature for soft masking (Stage 1)

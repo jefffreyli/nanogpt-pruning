@@ -1,10 +1,17 @@
 """
-Learned token pruning model modified from original model.py.
+GPT Language Model with Learned Token Pruning (LTP)
+Adapted from: https://arxiv.org/pdf/2107.00910 (Learned Token Pruning for Transformers)
+
+Key adaptations for decoder-only (causal) attention:
+1. Importance scores computed from causal attention patterns
+2. Progressive token pruning across layers
+3. Two-stage training: soft pruning -> hard pruning
 """
 
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -23,7 +30,15 @@ class LayerNorm(nn.Module):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
-class CausalSelfAttention(nn.Module):
+class CausalSelfAttentionLTP(nn.Module):
+    """
+    Causal Self-Attention with Learned Token Pruning
+
+    Key differences from standard attention:
+    - Computes token importance scores from attention patterns
+    - Returns attention scores for pruning decisions
+    - Handles variable-length sequences due to pruning
+    """
 
     def __init__(self, config):
         super().__init__()
@@ -40,25 +55,27 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        # However, flash attention doesn't return attention weights, so disable it when token pruning is enabled
-        flash_available = hasattr(
-            torch.nn.functional, 'scaled_dot_product_attention')
-        self.flash = flash_available and not getattr(
-            config, 'use_token_pruning', False)
+        self.flash = hasattr(torch.nn.functional,
+                             'scaled_dot_product_attention')
         if not self.flash:
-            if flash_available and getattr(config, 'use_token_pruning', False):
-                print(
-                    "WARNING: Flash Attention disabled because token pruning requires attention weights")
-            elif not flash_available:
-                print(
-                    "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                 .view(1, 1, config.block_size, config.block_size))
+            print(
+                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        # Always register this buffer since we need it for importance score computation
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                             .view(1, 1, config.block_size, config.block_size))
 
-    # Modification: add return_attention argument because LTP needs it to compute importance scores
-    def forward(self, x, return_attention=False):
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+    def forward(self, x, attention_mask=None):
+        """
+        Args:
+            x: (B, T, C) input tensor
+            attention_mask: (B, T) binary mask indicating which tokens are valid (1) vs pruned (0)
+
+        Returns:
+            y: (B, T, C) output tensor
+            importance_scores: (B, T) importance score for each token
+        """
+        B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
@@ -69,28 +86,48 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C //
                    self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # causal self-attention with importance score computation
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
+            # Note: Flash attention doesn't return attention weights, so we need to compute them separately for pruning
             y = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-            att = None
+                q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True
+            )
+            # Compute attention weights for importance scoring (without dropout for stability)
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            if attention_mask is not None:
+                # Mask out pruned tokens
+                attention_mask_expanded = attention_mask.view(B, 1, 1, T)
+                att = att.masked_fill(
+                    attention_mask_expanded == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            if attention_mask is not None:
+                # Mask out pruned tokens
+                attention_mask_expanded = attention_mask.view(B, 1, 1, T)
+                att = att.masked_fill(
+                    attention_mask_expanded == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # Compute importance scores as column mean of attention matrix
+        # For causal attention, we compute how much attention each token receives from all tokens that can attend to it
+        # Shape: (B, nh, T, T) -> (B, T)
+        importance_scores = att.mean(dim=1)  # Average across heads: (B, T, T)
+        # Column mean: how much attention does each token receive?
+        # For causal attention, we only consider valid attention positions
+        importance_scores = importance_scores.mean(dim=1)  # (B, T)
+
         # re-assemble all head outputs side by side
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-
-        if return_attention:
-            return y, att
-        return y
+        return y, importance_scores
 
 
 class MLP(nn.Module):
@@ -112,46 +149,117 @@ class MLP(nn.Module):
         return x
 
 
-class Block(nn.Module):
+class BlockLTP(nn.Module):
+    """
+    Transformer block with Learned Token Pruning
+    """
 
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
+        self.layer_idx = layer_idx
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttentionLTP(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        # Learnable threshold for this layer
+        # Initialize with linearly increasing values across layers
+        initial_threshold = (layer_idx + 1) / \
+            config.n_layer * config.final_token_threshold
+        self.threshold = nn.Parameter(torch.tensor(initial_threshold))
 
-# Modification: include pruning parameters
+        # Temperature for soft masking (used during soft pruning stage)
+        self.temperature = config.temperature
+
+    def compute_mask(self, importance_scores, masking_mode='hard'):
+        """
+        Compute pruning mask based on importance scores and threshold
+
+        Args:
+            importance_scores: (B, T) importance score for each token
+            masking_mode: 'soft' or 'hard'
+
+        Returns:
+            mask: (B, T) pruning mask (0 = prune, 1 = keep)
+        """
+        if masking_mode == 'soft':
+            # Soft differentiable mask using sigmoid
+            # mask = sigmoid((importance_score - threshold) / temperature)
+            mask = torch.sigmoid(
+                (importance_scores - self.threshold) / self.temperature)
+        else:  # hard
+            # Binary mask
+            mask = (importance_scores >= self.threshold).float()
+
+        return mask
+
+    def forward(self, x, attention_mask=None, masking_mode='hard', lambda_factor=0.0):
+        """
+        Args:
+            x: (B, T, C) input tensor
+            attention_mask: (B, T) binary mask indicating which tokens are valid
+            masking_mode: 'soft' or 'hard' pruning
+            lambda_factor: regularization weight for encouraging pruning
+
+        Returns:
+            x: (B, T, C) output tensor
+            new_mask: (B, T) updated attention mask after pruning
+            pruning_loss: scalar loss for encouraging pruning (only in soft mode)
+        """
+        # Self-attention with importance scores
+        attn_out, importance_scores = self.attn(self.ln_1(x), attention_mask)
+        x = x + attn_out
+
+        # Compute pruning mask
+        pruning_mask = self.compute_mask(importance_scores, masking_mode)
+
+        # Combine with existing attention mask
+        if attention_mask is not None:
+            combined_mask = attention_mask * pruning_mask
+        else:
+            combined_mask = pruning_mask
+
+        # Apply mask to token representations
+        if masking_mode == 'soft':
+            # Soft pruning: multiply by soft mask
+            x = x * combined_mask.unsqueeze(-1)
+        else:
+            # Hard pruning: set pruned tokens to zero
+            x = x * combined_mask.unsqueeze(-1)
+
+        # MLP
+        x = x + self.mlp(self.ln_2(x))
+
+        # Compute pruning loss (encourages more pruning)
+        # Loss is the average mask value (we want to minimize this to prune more)
+        pruning_loss = torch.tensor(0.0, device=x.device)
+        if masking_mode == 'soft' and lambda_factor > 0:
+            pruning_loss = lambda_factor * combined_mask.mean()
+
+        return x, combined_mask, pruning_loss
 
 
 @dataclass
-class GPTWithLTPConfig:
+class GPTConfigLTP:
     block_size: int = 1024
-    # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     bias: bool = True
-
-    use_token_pruning: bool = False
-    pruning_temperature: float = 0.01  # Temperature for soft pruning
-    lambda_sparsity: float = 0.1  # Sparsity regularization weight
-    # Importance scoring method for causal attention
-    # Options: 'naive_col' (original), 'row', 'causal_col', 'future_aware'
-    importance_method: str = 'causal_col'
-
-# Modification: Use Block or LTPBlock based on config
+    # LTP-specific parameters
+    final_token_threshold: float = 0.01  # Threshold for the final layer
+    temperature: float = 5.0  # Temperature for soft masking
+    masking_mode: str = 'hard'  # 'soft' or 'hard'
+    lambda_factor: float = 0.1  # Regularization weight for pruning loss
+    prune_mode: str = 'learned'  # 'learned', 'manual', or 'none'
 
 
-class GPTWithLTP(nn.Module):
+class GPTLTP(nn.Module):
+    """
+    GPT model with Learned Token Pruning (LTP)
+    """
 
     def __init__(self, config):
         super().__init__()
@@ -159,25 +267,15 @@ class GPTWithLTP(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        if config.use_token_pruning:
-            blocks = [LTPBlock(config, layer_id=i, use_pruning=True)
-                      for i in range(config.n_layer)]
-        else:
-            blocks = [Block(config) for _ in range(config.n_layer)]
-
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size, config.n_embd),
             wpe=nn.Embedding(config.block_size, config.n_embd),
             drop=nn.Dropout(config.dropout),
-            h=nn.ModuleList(blocks),
+            h=nn.ModuleList([BlockLTP(config, i)
+                            for i in range(config.n_layer)]),
             ln_f=LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        # https://paperswithcode.com/method/weight-tying
         self.transformer.wte.weight = self.lm_head.weight
 
         # init all weights
@@ -188,16 +286,9 @@ class GPTWithLTP(nn.Module):
                 torch.nn.init.normal_(
                     p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-        # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def get_num_params(self, non_embedding=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
             n_params -= self.transformer.wpe.weight.numel()
@@ -211,12 +302,11 @@ class GPTWithLTP(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    # Modification: add regularization loss computation
-    def forward(self, idx, targets=None, return_pruning_info=False):
+    def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         # forward the GPT model itself
         # token embeddings of shape (b, t, n_embd)
@@ -225,191 +315,67 @@ class GPTWithLTP(nn.Module):
         pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
 
-        # Modification: collect pruning info during single forward pass
-        # Collect pruning info if explicitly requested OR if training with token pruning (for sparsity loss)
-        collect_pruning_info = return_pruning_info or (
-            self.config.use_token_pruning and self.training and targets is not None)
-        pruning_info = []
+        # Initialize attention mask (all tokens are valid initially)
+        attention_mask = torch.ones(b, t, dtype=torch.float, device=device)
+
+        # Track total pruning loss
+        total_pruning_loss = torch.tensor(0.0, device=device)
+
+        # Forward through transformer blocks with progressive pruning
         for block in self.transformer.h:
-            if self.config.use_token_pruning and collect_pruning_info:
-                x, stats = block(x, return_pruning_info=True)
-                pruning_info.append(stats)
+            if self.config.prune_mode == 'learned':
+                x, attention_mask, pruning_loss = block(
+                    x,
+                    attention_mask,
+                    masking_mode=self.config.masking_mode,
+                    lambda_factor=self.config.lambda_factor
+                )
+                total_pruning_loss = total_pruning_loss + pruning_loss
             else:
-                x = block(x)
+                # No pruning - standard forward pass
+                attn_out, _ = block.attn(block.ln_1(x), attention_mask)
+                x = x + attn_out
+                x = x + block.mlp(block.ln_2(x))
 
         x = self.transformer.ln_f(x)
 
-        # Modification: compute loss with sparsity regularization
         if targets is not None:
+            # Calculate language modeling loss
             logits = self.lm_head(x)
-            ce_loss = F.cross_entropy(
+            lm_loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
-            if self.config.use_token_pruning and self.training and len(pruning_info) > 0:
-                sparsity_loss = self.compute_sparsity_loss(pruning_info)
-                loss = ce_loss + self.config.lambda_sparsity * sparsity_loss
+            # Add pruning loss
+            if self.config.prune_mode == 'learned' and self.config.masking_mode == 'soft':
+                loss = lm_loss + total_pruning_loss
             else:
-                loss = ce_loss
+                loss = lm_loss
         else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])
             loss = None
 
-        if return_pruning_info:
-            return logits, loss, pruning_info
         return logits, loss
-
-    def compute_sparsity_loss(self, pruning_info):
-        """
-        L1 regularization on pruning masks to encourage sparsity.
-        Returns the average proportion of tokens kept across all layers.
-
-        Args:
-            pruning_info: list of dicts from each layer
-        Returns:
-            sparsity_loss: scalar tensor in [0, 1]
-        """
-        total_mask_sum = 0.0
-        total_elements = 0
-
-        for stats in pruning_info:
-            if stats['pruning_mask'] is not None:
-                total_mask_sum += stats['pruning_mask'].sum()
-                total_elements += stats['pruning_mask'].numel()
-
-        if total_elements > 0:
-            sparsity_loss = total_mask_sum / total_elements
-        else:
-            sparsity_loss = torch.tensor(0.0)
-
-        return sparsity_loss
-
-    def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(
-            self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,
-                                                  :, :block_size, :block_size]
-
-    @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {}  # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            # 124M params
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),
-            # 350M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024),
-            # 774M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280),
-            # 1558M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600),
-        }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        # always 50257 for GPT model checkpoints
-        config_args['vocab_size'] = 50257
-        # always 1024 for GPT model checkpoints
-        config_args['block_size'] = 1024
-        config_args['bias'] = True  # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
-        if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        # discard this mask / buffer, not a param
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(
-            '.attn.masked_bias')]  # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(
-            '.attn.bias')]  # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight',
-                      'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(
-            sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # speecial treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-
-        # Separate threshold parameters (need much lower learning rate)
-        # Threshold gradients are amplified by 1/temperature and accumulate across all tokens
-        threshold_params = [
-            p for n, p in param_dict.items() if 'threshold' in n]
-        non_threshold_dict = {n: p for n,
-                              p in param_dict.items() if 'threshold' not in n}
-
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in non_threshold_dict.items()
-                        if p.dim() >= 2]
-        nodecay_params = [
-            p for n, p in non_threshold_dict.items() if p.dim() < 2]
-
-        # Threshold parameters get 1/100th of the learning rate (no weight decay)
-        threshold_lr = learning_rate * 0.01
-
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0},
+            {'params': nodecay_params, 'weight_decay': 0.0}
         ]
-
-        if threshold_params:
-            optim_groups.append({
-                'params': threshold_params,
-                'weight_decay': 0.0,
-                'lr': threshold_lr
-            })
-
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        num_threshold_params = len(threshold_params)
         print(
             f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(
             f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        if threshold_params:
-            print(
-                f"num threshold parameters: {num_threshold_params}, with lr={threshold_lr:.2e}")
-
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(
             torch.optim.AdamW).parameters
@@ -421,28 +387,11 @@ class GPTWithLTP(nn.Module):
 
         return optimizer
 
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt)  # per second
-        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
-
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
@@ -465,214 +414,97 @@ class GPTWithLTP(nn.Module):
 
         return idx
 
-# Modification: Additional classes to compute token importance scores and LTP block
-
-
-class TokenImportanceScorer(nn.Module):
-    """
-    Compute token importance scores from attention weights.
-
-    For causal/decoder attention (GPT), the naive column-average approach is biased
-    because later tokens can only be "voted on" by fewer tokens due to causal masking.
-
-    This class provides multiple scoring methods to address this bias:
-    - naive_col: Original column mean (biased for causal attention)
-    - row: Row mean - how much each token attends outward
-    - causal_col: Column sum normalized by actual number of voters
-    - future_aware: Position-weighted attention (later positions weighted higher)
-    """
-
-    def __init__(self, method: str = 'causal_col'):
-        super().__init__()
-        self.method = method
-        valid_methods = {'naive_col', 'row', 'causal_col', 'future_aware'}
-        if method not in valid_methods:
-            raise ValueError(
-                f"Unknown importance method: {method}. Valid options: {valid_methods}")
-
-    def compute_importance_score(self, attention_weights):
+    def get_pruning_stats(self, idx):
         """
-        Compute token importance scores using the configured method.
-
-        Args:
-            attention_weights: attention matrix (B, n_head, T, T) with causal mask applied
-        Returns:
-            importance_scores: (B, T)
+        Get pruning statistics for a given input
+        Returns the number of tokens kept at each layer
         """
-        if attention_weights is None:
-            return None
+        device = idx.device
+        b, t = idx.size()
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
 
-        B, n_head, T, T_kv = attention_weights.shape
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
 
-        # Average over heads: (B, n_head, T, T) -> (B, T, T)
-        avg_attention = attention_weights.mean(dim=1)
+        attention_mask = torch.ones(b, t, dtype=torch.float, device=device)
 
-        if self.method == 'naive_col':
-            # Original: Column mean - how much attention each token receives
-            # BIASED for causal attention: early tokens get more votes
-            # (B, T, T) -> (B, T)
-            importance_scores = avg_attention.mean(dim=1)
-
-        elif self.method == 'row':
-            # Row mean: How much each token attends to others
-            # In causal attention, token i attends to positions 0..i
-            # Later tokens attend to more positions, so normalize
-            importance_scores = avg_attention.mean(dim=-1)  # (B, T)
-
-        elif self.method == 'causal_col':
-            # Column sum normalized by number of voters per position
-            # In causal attention, position i can only be attended to by positions i..T-1
-            # So position 0 gets T votes, position 1 gets T-1 votes, ..., position T-1 gets 1 vote
-            # (B, T) - sum of attention each token receives
-            attention_received = avg_attention.sum(dim=1)
-            # Number of tokens that can vote for each position: [T, T-1, T-2, ..., 1]
-            num_voters = torch.arange(
-                T, 0, -1, device=attention_weights.device, dtype=attention_weights.dtype)
-            importance_scores = attention_received / \
-                num_voters.unsqueeze(0)  # (B, T)
-
-        elif self.method == 'future_aware':
-            # Weight attention by the position of the attending token
-            # Later tokens (which see more context) have higher weight
-            position_weights = torch.arange(
-                1, T + 1, device=attention_weights.device, dtype=attention_weights.dtype)
-            position_weights = position_weights.view(
-                1, T, 1)  # (1, T, 1) for broadcasting
-            # Weight each row by position of the attending token
-            weighted_attention = avg_attention * position_weights  # (B, T, T)
-            # Sum weighted attention received by each token, normalize by total weight
-            importance_scores = weighted_attention.sum(
-                dim=1) / position_weights.sum()  # (B, T)
-
-        return importance_scores
-
-# Modification of Block class
-
-
-class LTPBlock(nn.Module):
-    """Transformer block with Learned Token Pruning"""
-
-    def __init__(self, config, layer_id, use_pruning=True):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-
-        self.use_pruning = use_pruning
-        self.layer_id = layer_id
-
-        if use_pruning:
-            # Learnable threshold parameter - initialize based on expected importance scores
-            # For causal attention, average importance ≈ 1/block_size
-            # Initialize thresholds below this to keep most tokens initially
-            expected_importance = 1.0 / config.block_size  # e.g., ~0.002 for T=512
-
-            if config.n_layer > 1:
-                # Layer 0: 50% of expected (keep most tokens)
-                # Layer n_layer-1: 100% of expected (prune around average)
-                layer_ratio = layer_id / (config.n_layer - 1)
-                threshold_init = expected_importance * \
-                    (0.5 + layer_ratio * 0.5)
+        stats = []
+        for i, block in enumerate(self.transformer.h):
+            if self.config.prune_mode == 'learned':
+                x, attention_mask, _ = block(
+                    x,
+                    attention_mask,
+                    masking_mode='hard',  # Use hard masking for stats
+                    lambda_factor=0.0
+                )
+                num_kept = attention_mask.sum(dim=1).mean().item()
+                stats.append({
+                    'layer': i,
+                    'avg_tokens_kept': num_kept,
+                    'keep_ratio': num_kept / t,
+                    'threshold': block.threshold.item()
+                })
             else:
-                threshold_init = expected_importance * 0.5
-            self.threshold = nn.Parameter(torch.tensor(threshold_init))
+                attn_out, _ = block.attn(block.ln_1(x), attention_mask)
+                x = x + attn_out
+                x = x + block.mlp(block.ln_2(x))
 
-            # Token importance scorer with causal-aware method
-            importance_method = getattr(
-                config, 'importance_method', 'causal_col')
-            self.importance_scorer = TokenImportanceScorer(
-                method=importance_method)
+        return stats
 
-            # Temperature for soft pruning (hyperparameter)
-            self.temperature = config.pruning_temperature  # e.g., 0.01
 
-            # Training mode: soft or hard pruning
-            self.use_soft_pruning = True  # Toggle during training stages
+# Training helper functions
+def train_ltp_soft_stage(model, train_loader, config, num_epochs=1):
+    """
+    Stage 1: Train with soft pruning to learn thresholds
+    """
+    model.config.masking_mode = 'soft'
+    model.train()
 
-    def compute_soft_mask(self, importance_scores):
-        """
-        Differentiable soft mask using sigmoid
+    optimizer = model.configure_optimizers(
+        weight_decay=0.0,  # No weight decay for soft stage
+        learning_rate=2e-5,
+        betas=(0.9, 0.999),
+        device_type='cuda' if torch.cuda.is_available() else 'cpu'
+    )
 
-        Args:
-            importance_scores: (B, T)
-        Returns:
-            soft_mask: (B, T) values in [0, 1]
-        """
-        soft_mask = torch.sigmoid(
-            (importance_scores - self.threshold) / self.temperature)
-        return soft_mask
+    for epoch in range(num_epochs):
+        for batch_idx, (data, targets) in enumerate(train_loader):
+            optimizer.zero_grad()
+            logits, loss = model(data, targets)
+            loss.backward()
+            optimizer.step()
 
-    def compute_hard_mask(self, importance_scores):
-        """
-        Binary hard mask for inference
+            if batch_idx % 100 == 0:
+                print(
+                    f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}")
 
-        Args:
-            importance_scores: (B, T)
-        Returns:
-            hard_mask: (B, T) values in {0, 1}
-        """
-        hard_mask = (importance_scores > self.threshold).float()
-        return hard_mask
 
-    def forward(self, x, return_pruning_info=False):
-        """
-        Args:
-            x: (B, T, C)
-        Returns:
-            x: (B, T, C) - with pruned tokens masked
-        """
-        B, T, C = x.size()
+def train_ltp_hard_stage(model, train_loader, config, num_epochs=5):
+    """
+    Stage 2: Fine-tune with hard pruning (thresholds fixed)
+    """
+    model.config.masking_mode = 'hard'
+    model.train()
 
-        # Attention with weights
-        if self.use_pruning:
-            attn_out, attn_weights = self.attn(
-                self.ln_1(x), return_attention=True)
-        else:
-            attn_out = self.attn(self.ln_1(x))
-            attn_weights = None
+    # Freeze thresholds
+    for block in model.transformer.h:
+        block.threshold.requires_grad = False
 
-        x = x + attn_out
+    optimizer = model.configure_optimizers(
+        weight_decay=0.01,
+        learning_rate=1e-5,
+        betas=(0.9, 0.999),
+        device_type='cuda' if torch.cuda.is_available() else 'cpu'
+    )
 
-        # Apply pruning
-        pruning_mask = None
-        importance_scores = None
-        tokens_kept_ratio = 1.0
+    for epoch in range(num_epochs):
+        for batch_idx, (data, targets) in enumerate(train_loader):
+            optimizer.zero_grad()
+            logits, loss = model(data, targets)
+            loss.backward()
+            optimizer.step()
 
-        if self.use_pruning:
-            if attn_weights is None:
-                raise RuntimeError(
-                    f"Token pruning requires attention weights, but they are None. This can happen if Flash Attention is enabled. Ensure use_token_pruning=True disables Flash Attention in CausalSelfAttention.")
-            # Compute importance scores
-            importance_scores = self.importance_scorer.compute_importance_score(
-                attn_weights)
-
-            if importance_scores is None:
-                raise RuntimeError(
-                    f"Token importance scores could not be computed from attention weights.")
-
-            # Compute mask (soft during training, hard during eval)
-            if self.training and self.use_soft_pruning:
-                pruning_mask = self.compute_soft_mask(importance_scores)
-            else:
-                pruning_mask = self.compute_hard_mask(importance_scores)
-
-            # Apply mask to output (element-wise multiply)
-            # Shape: (B, T, C) * (B, T, 1) -> (B, T, C)
-            x = x * pruning_mask.unsqueeze(-1)
-
-            tokens_kept_ratio = pruning_mask.sum() / pruning_mask.numel()
-
-        # MLP
-        x = x + self.mlp(self.ln_2(x))
-
-        # Modification: used for regularization loss computation
-        if return_pruning_info:
-            return x, {
-                'pruning_mask': pruning_mask,
-                'importance_scores': importance_scores,
-                'tokens_kept_ratio': tokens_kept_ratio,
-                'threshold': self.threshold.item() if self.use_pruning else None
-            }
-
-        return x
+            if batch_idx % 100 == 0:
+                print(
+                    f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}")

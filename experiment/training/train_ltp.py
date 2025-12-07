@@ -17,9 +17,8 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from experiment.models.ltp_model import GPTWithLTP, GPTWithLTPConfig
+# Import the LTP model
+from experiment.models.ltp_model import GPTLTP, GPTConfigLTP
 
 # I/O
 out_dir = 'out-ltp'
@@ -28,7 +27,7 @@ log_interval = 10
 eval_iters = 100
 eval_only = False
 always_save_checkpoint = True
-init_from = 'scratch'  # 'scratch' or 'resume'
+init_from = 'scratch'  # 'scratch', 'resume', or 'pretrained'
 
 # wandb logging
 wandb_log = False
@@ -49,9 +48,15 @@ dropout = 0.1
 bias = False
 
 # LTP-specific parameters
-use_token_pruning = False
-pruning_temperature = 0.01
-lambda_sparsity = 0.1
+# Set prune_mode='learned' to enable token pruning
+prune_mode = 'none'  # 'learned' to enable pruning, 'none' to disable
+# Threshold for the final layer (higher = more pruning)
+final_token_threshold = 0.01
+temperature = 5.0  # Temperature for soft masking (Stage 1)
+# 'soft' for Stage 1 (learning thresholds), 'hard' for Stage 2 (fine-tuning)
+masking_mode = 'soft'
+lambda_factor = 0.1  # Regularization weight for pruning loss (Stage 1 only)
+freeze_non_threshold_params = False  # If True, only train threshold parameters
 
 # optimizer
 learning_rate = 3e-4
@@ -77,7 +82,8 @@ compile = False  # torch.compile not always compatible with custom models
 config_keys = [k for k, v in globals().items() if not k.startswith(
     '_') and isinstance(v, (int, float, bool, str))]
 # overrides from command line or config file
-exec(open('configurator.py').read())
+if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+    exec(open(sys.argv[1]).read())
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
@@ -105,7 +111,12 @@ if master_process:
     print(f"tokens per iteration: {tokens_per_iter:,}")
     print(f"using device: {device}")
     print(f"using dtype: {dtype}")
-    print(f"token pruning enabled: {use_token_pruning}")
+    print(f"token pruning enabled: {prune_mode == 'learned'}")
+    if prune_mode == 'learned':
+        print(f"  masking_mode: {masking_mode}")
+        print(f"  final_token_threshold: {final_token_threshold}")
+        print(f"  lambda_factor: {lambda_factor}")
+        print(f"  freeze non-threshold params: {freeze_non_threshold_params}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -167,144 +178,93 @@ model_args = dict(
     bias=bias,
     vocab_size=meta_vocab_size if meta_vocab_size is not None else 50304,
     dropout=dropout,
-    use_token_pruning=use_token_pruning,
-    pruning_temperature=pruning_temperature,
-    lambda_sparsity=lambda_sparsity,
+    # LTP-specific parameters
+    prune_mode=prune_mode,
+    final_token_threshold=final_token_threshold,
+    temperature=temperature,
+    masking_mode=masking_mode,
+    lambda_factor=lambda_factor,
 )
 
 if init_from == 'scratch':
     if master_process:
         print("Initializing LTP model from scratch")
-    gptconf = GPTWithLTPConfig(**model_args)
-    model = GPTWithLTP(gptconf)
+    gptconf = GPTConfigLTP(**model_args)
+    model = GPTLTP(gptconf)
+
 elif init_from == 'resume':
     if master_process:
         print(f"Resuming training from {out_dir}")
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
+
+    # Update model_args with checkpoint values
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
-    gptconf = GPTWithLTPConfig(**model_args)
-    model = GPTWithLTP(gptconf)
+
+    # Create model and load state
+    gptconf = GPTConfigLTP(**model_args)
+    model = GPTLTP(gptconf)
+
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
     for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
+
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+
 elif init_from == 'pretrained':
-    # Load from a pretrained checkpoint (e.g., baseline_ckpt.pt)
-    # and add LTP pruning capabilities
-    pretrained_path = 'experiment/models/baseline_ckpt.pt'
+    # Load from a pretrained baseline model and add LTP pruning capabilities
+    pretrained_path = './experiment/models/baseline_ckpt.pt'  # Update this path as needed
     if master_process:
         print(
             f"Loading pretrained model from {pretrained_path} and adding LTP")
+
     checkpoint = torch.load(pretrained_path, map_location=device)
 
-    # Get vocab size and config from checkpoint
-    ckpt_config = checkpoint['config']
-    vocab_size = checkpoint['model']['transformer.wte.weight'].shape[0]
+    # Get config from checkpoint
+    if 'config' in checkpoint:
+        ckpt_config = checkpoint['config']
+        model_args.update({
+            'n_layer': ckpt_config.get('n_layer', n_layer),
+            'n_head': ckpt_config.get('n_head', n_head),
+            'n_embd': ckpt_config.get('n_embd', n_embd),
+            'block_size': ckpt_config.get('block_size', block_size),
+            'bias': ckpt_config.get('bias', bias),
+        })
 
-    if master_process:
-        print(f"\n{'='*60}")
-        print("CHECKPOINT DIAGNOSTICS")
-        print(f"{'='*60}")
-        print(f"Checkpoint keys: {list(checkpoint.keys())}")
-        print(f"Checkpoint config: {ckpt_config}")
-        print(f"Vocab size from weights: {vocab_size}")
-        print(
-            f"Number of weight tensors in checkpoint: {len(checkpoint['model'])}")
-        # Print a few sample checkpoint keys
-        ckpt_keys = list(checkpoint['model'].keys())[:10]
-        print(f"Sample checkpoint weight keys: {ckpt_keys}")
-        if 'best_val_loss' in checkpoint:
-            print(
-                f"Checkpoint best_val_loss: {checkpoint['best_val_loss']:.4f}")
-        if 'iter_num' in checkpoint:
-            print(f"Checkpoint iter_num: {checkpoint['iter_num']}")
-        print(f"{'='*60}\n")
-
-    # Update model_args with checkpoint values
-    model_args.update({
-        'vocab_size': vocab_size,
-        'n_layer': ckpt_config['n_layer'],
-        'n_head': ckpt_config['n_head'],
-        'n_embd': ckpt_config['n_embd'],
-        'block_size': ckpt_config['block_size'],
-        'bias': ckpt_config['bias'],
-    })
+    # Get vocab_size from model weights if not in config
+    if 'model' in checkpoint:
+        vocab_size = checkpoint['model']['transformer.wte.weight'].shape[0]
+        model_args['vocab_size'] = vocab_size
 
     # Create LTP model with pruning enabled
-    gptconf = GPTWithLTPConfig(**model_args)
-    model = GPTWithLTP(gptconf)
+    gptconf = GPTConfigLTP(**model_args)
+    model = GPTLTP(gptconf)
 
-    if master_process:
-        print(f"Model state dict keys: {len(model.state_dict())}")
-        model_keys = list(model.state_dict().keys())[:10]
-        print(f"Sample model weight keys: {model_keys}")
-
-    # Load pretrained weights (strict=False allows new pruning params)
-    result = model.load_state_dict(checkpoint['model'], strict=False)
-    if master_process:
-        print(
-            f"\nLoaded {len(model.state_dict()) - len(result.missing_keys)} pretrained parameters")
-        print(f"Missing keys (new params): {len(result.missing_keys)}")
-        print(
-            f"Unexpected keys (in ckpt but not model): {len(result.unexpected_keys)}")
-        if result.missing_keys:
-            print(f"Missing keys: {result.missing_keys[:20]}")
-        if result.unexpected_keys:
-            print(f"Unexpected keys: {result.unexpected_keys[:20]}")
-
-        # Verify some weights are non-zero and look reasonable
-        wte = model.transformer.wte.weight
-        print(f"\nWeight verification:")
-        print(f"  wte.weight: mean={wte.mean().item():.6f}, std={wte.std().item():.6f}, "
-              f"min={wte.min().item():.6f}, max={wte.max().item():.6f}")
-        h0_attn = model.transformer.h[0].attn.c_attn.weight
-        print(
-            f"  h[0].attn.c_attn.weight: mean={h0_attn.mean().item():.6f}, std={h0_attn.std().item():.6f}")
+    # Load pretrained weights (strict=False allows new pruning parameters)
+    if 'model' in checkpoint:
+        result = model.load_state_dict(checkpoint['model'], strict=False)
+        if master_process:
+            print(
+                f"Loaded {len(model.state_dict()) - len(result.missing_keys)} pretrained parameters")
+            print(
+                f"Initialized {len(result.missing_keys)} new pruning parameters")
+            if result.missing_keys:
+                threshold_params = [
+                    k for k in result.missing_keys if 'threshold' in k]
+                if threshold_params:
+                    print(f"New threshold parameters: {threshold_params}")
 
 model.to(device)
 
-# DIAGNOSTIC: Immediate validation check after loading model
-if master_process and init_from == 'pretrained':
-    print(f"\n{'='*60}")
-    print("IMMEDIATE VALIDATION CHECK (before any training setup)")
-    print(f"{'='*60}")
-    model.eval()
-
-    # Quick validation on a few batches
-    val_losses = []
-    with torch.no_grad():
-        for _ in range(10):  # Just 10 batches for quick check
-            X, Y = get_batch('val')
-            with ctx:
-                logits, loss = model(X, Y)
-            val_losses.append(loss.item())
-
-    avg_val_loss = sum(val_losses) / len(val_losses)
-    print(f"Immediate validation loss (10 batches): {avg_val_loss:.4f}")
-    print(f"Expected for pretrained GPT-2 on WT2: ~3.0-4.0")
-
-    if avg_val_loss > 10.0:
-        print("\n⚠️  WARNING: Loss is very high!")
-        print("This suggests either:")
-        print("  1. The baseline checkpoint wasn't properly trained")
-        print("  2. There's a weight loading mismatch")
-        print("  3. Data/tokenization mismatch with the model")
-    elif avg_val_loss < 5.0:
-        print("\n✓ Loss looks reasonable for a pretrained model")
-
-    print(f"{'='*60}\n")
-    model.train()
-
-# Freeze all parameters except threshold parameters (only when token pruning is enabled)
-# This allows us to learn optimal pruning thresholds without modifying pretrained weights
-if use_token_pruning:
+# Optionally freeze all parameters except thresholds
+# This is useful for Stage 1 when you want to learn optimal thresholds without modifying pretrained weights
+if freeze_non_threshold_params and prune_mode == 'learned':
     if master_process:
         print("Freezing all parameters except threshold parameters...")
 
@@ -323,15 +283,18 @@ if use_token_pruning:
             f"Frozen {frozen_count} parameter tensors, {trainable_count} threshold parameters trainable")
 else:
     if master_process:
-        print("Token pruning disabled - all parameters trainable")
+        if prune_mode == 'learned':
+            print("All parameters trainable (including thresholds)")
+        else:
+            print("Token pruning disabled - all parameters trainable")
 
 # Initialize GradScaler for mixed precision training
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# Optimizer - only threshold parameters will be optimized
+# Optimizer
 optimizer = model.configure_optimizers(
     weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
+if init_from == 'resume' and 'optimizer' in checkpoint:
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None
 
@@ -356,15 +319,12 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
-
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
-
         out[split] = losses.mean()
-
     model.train()
     return out
 
@@ -372,43 +332,41 @@ def estimate_loss():
 @torch.no_grad()
 def get_pruning_stats():
     """Get pruning statistics for each layer."""
-    if not use_token_pruning:
+    if prune_mode != 'learned':
         return None
 
     model.eval()
 
     # Get underlying model (handle DDP wrapper)
-    if hasattr(model, 'module'):
-        raw_model = model.module
-    else:
-        raw_model = model
+    raw_model = model.module if ddp else model
 
     # Run a single batch to get pruning info
     X, Y = get_batch('val')
     with ctx:
-        logits, loss, pruning_info = raw_model(X, Y, return_pruning_info=True)
+        # Get pruning stats using the model's built-in method
+        stats_list = raw_model.get_pruning_stats(X)
 
+    # Aggregate stats
     stats = {
         'layer_stats': [],
         'total_tokens_kept': 0.0,
         'total_tokens': 0.0,
     }
 
-    for layer_idx, layer_info in enumerate(pruning_info):
-        if layer_info['pruning_mask'] is not None:
-            kept_ratio = layer_info['tokens_kept_ratio']
-            if isinstance(kept_ratio, torch.Tensor):
-                kept_ratio = kept_ratio.item()
-            threshold = layer_info['threshold']
+    for layer_stat in stats_list:
+        kept_ratio = layer_stat['keep_ratio']
+        if isinstance(kept_ratio, torch.Tensor):
+            kept_ratio = kept_ratio.item()
 
-            stats['layer_stats'].append({
-                'layer': layer_idx,
-                'kept_ratio': kept_ratio,
-                'pruned_ratio': 1.0 - kept_ratio,
-                'threshold': threshold,
-            })
-            stats['total_tokens_kept'] += kept_ratio
-            stats['total_tokens'] += 1.0
+        stats['layer_stats'].append({
+            'layer': layer_stat['layer'],
+            'kept_ratio': kept_ratio,
+            'pruned_ratio': 1.0 - kept_ratio,
+            'threshold': layer_stat['threshold'],
+            'avg_tokens_kept': layer_stat['avg_tokens_kept'],
+        })
+        stats['total_tokens_kept'] += kept_ratio
+        stats['total_tokens'] += 1.0
 
     if stats['total_tokens'] > 0:
         stats['avg_kept_ratio'] = stats['total_tokens_kept'] / \
@@ -427,23 +385,25 @@ def print_pruning_stats(stats):
     if stats is None:
         return
 
-    print("\n" + "="*60)
+    print("\n" + "="*70)
     print("Token Pruning Statistics per Layer")
-    print("="*60)
-    print(f"{'Layer':<8} {'Kept %':<12} {'Pruned %':<12} {'Threshold':<12}")
-    print("-"*60)
+    print("="*70)
+    print(f"{'Layer':<8} {'Tokens Kept':<14} {'Kept %':<10} {'Pruned %':<10} {'Threshold':<12}")
+    print("-"*70)
 
     for layer_stat in stats['layer_stats']:
         print(f"{layer_stat['layer']:<8} "
+              f"{layer_stat['avg_tokens_kept']:<14.1f} "
               f"{layer_stat['kept_ratio']*100:>6.2f}%     "
               f"{layer_stat['pruned_ratio']*100:>6.2f}%     "
               f"{layer_stat['threshold']:.6f}")
 
-    print("-"*60)
+    print("-"*70)
     print(f"{'AVERAGE':<8} "
+          f"{'':<14} "
           f"{stats['avg_kept_ratio']*100:>6.2f}%     "
           f"{stats['avg_pruned_ratio']*100:>6.2f}%")
-    print("="*60 + "\n")
+    print("="*70 + "\n")
 
 # Learning rate scheduler
 
@@ -467,10 +427,18 @@ if wandb_log and master_process:
 
 # Training loop
 if master_process:
-    print(f"Starting training for {max_iters} iterations")
+    print(f"\nStarting training for {max_iters} iterations")
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     print(
         f"Effective batch size: {batch_size * gradient_accumulation_steps * ddp_world_size}")
+    if prune_mode == 'learned':
+        print(f"\nLTP Training Configuration:")
+        print(f"  Stage: {masking_mode} pruning")
+        print(f"  Final token threshold: {final_token_threshold}")
+        if masking_mode == 'soft':
+            print(f"  Lambda factor: {lambda_factor}")
+            print(f"  Temperature: {temperature}")
+        print()
 
 X, Y = get_batch('train')
 t0 = time.time()
@@ -491,7 +459,7 @@ while True:
             f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
         # Print pruning statistics if token pruning is enabled
-        if use_token_pruning:
+        if prune_mode == 'learned':
             pruning_stats = get_pruning_stats()
             print_pruning_stats(pruning_stats)
 
@@ -503,7 +471,7 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu * 100,
             }
-            if use_token_pruning and pruning_stats:
+            if prune_mode == 'learned' and pruning_stats:
                 log_dict.update({
                     "pruning/avg_kept_ratio": pruning_stats['avg_kept_ratio'],
                     "pruning/avg_pruned_ratio": pruning_stats['avg_pruned_ratio'],
@@ -565,9 +533,11 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5:
-            mfu = raw_model.estimate_mfu(
-                batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+            # Estimate MFU if available
+            if hasattr(raw_model, 'estimate_mfu'):
+                mfu = raw_model.estimate_mfu(
+                    batch_size * gradient_accumulation_steps, dt)
+                running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
         print(
             f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
 
@@ -582,6 +552,10 @@ if ddp:
     destroy_process_group()
 
 if master_process:
-    print("Training complete!")
+    print("\nTraining complete!")
     print(f"Best validation loss: {best_val_loss:.4f}")
     print(f"Final checkpoint saved to {out_dir}/ckpt.pt")
+    if prune_mode == 'learned':
+        print("\nFinal pruning statistics:")
+        final_stats = get_pruning_stats()
+        print_pruning_stats(final_stats)

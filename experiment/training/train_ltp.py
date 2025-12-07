@@ -5,6 +5,7 @@ Usage:
     python experiment/training/train_ltp.py config/train_ltp_wt2.py
 """
 
+from experiment.models.ltp_model import GPTWithLTP, GPTWithLTPConfig
 import os
 import sys
 import time
@@ -19,7 +20,6 @@ from torch.distributed import init_process_group, destroy_process_group
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from experiment.models.ltp_model import GPTWithLTP, GPTWithLTPConfig
 
 # I/O
 out_dir = 'out-ltp'
@@ -49,7 +49,7 @@ dropout = 0.1
 bias = False
 
 # LTP-specific parameters
-use_token_pruning = True
+use_token_pruning = False
 pruning_temperature = 0.01
 lambda_sparsity = 0.1
 
@@ -234,24 +234,28 @@ elif init_from == 'pretrained':
 
 model.to(device)
 
-# Freeze all parameters except threshold parameters
+# Freeze all parameters except threshold parameters (only when token pruning is enabled)
 # This allows us to learn optimal pruning thresholds without modifying pretrained weights
-if use_token_pruning and master_process:
-    print("Freezing all parameters except threshold parameters...")
+if use_token_pruning:
+    if master_process:
+        print("Freezing all parameters except threshold parameters...")
 
-frozen_count = 0
-trainable_count = 0
-for name, param in model.named_parameters():
-    if 'threshold' in name:
-        param.requires_grad = True
-        trainable_count += 1
-    else:
-        param.requires_grad = False
-        frozen_count += 1
+    frozen_count = 0
+    trainable_count = 0
+    for name, param in model.named_parameters():
+        if 'threshold' in name:
+            param.requires_grad = True
+            trainable_count += 1
+        else:
+            param.requires_grad = False
+            frozen_count += 1
 
-if master_process:
-    print(
-        f"Frozen {frozen_count} parameter tensors, {trainable_count} threshold parameters trainable")
+    if master_process:
+        print(
+            f"Frozen {frozen_count} parameter tensors, {trainable_count} threshold parameters trainable")
+else:
+    if master_process:
+        print("Token pruning disabled - all parameters trainable")
 
 # Initialize GradScaler for mixed precision training
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))

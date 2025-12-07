@@ -32,12 +32,15 @@ dropout = 0.0
 bias = True
 
 # LTP-specific parameters
-use_token_pruning = True
+use_token_pruning = False  # TEMPORARILY DISABLED to verify pretrained model
 pruning_temperature = 0.01  # Temperature for soft pruning mask
 lambda_sparsity = 0.1       # Sparsity regularization weight
 # Importance scoring method for causal attention
 # Options: 'naive_col' (original, biased), 'row', 'causal_col' (recommended), 'future_aware'
 importance_method = 'causal_col'
+
+# Evaluation only mode - set to True to just evaluate without training
+eval_only = True
 
 # train length / lr
 max_iters = 1000

@@ -5,7 +5,6 @@ Usage:
     python experiment/training/train_ltp.py config/train_ltp_wt2.py
 """
 
-from experiment.models.ltp_model import GPTWithLTP, GPTWithLTPConfig
 import os
 import sys
 import time
@@ -20,6 +19,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from experiment.models.ltp_model import GPTWithLTP, GPTWithLTPConfig
 
 # I/O
 out_dir = 'out-ltp'
@@ -208,6 +208,25 @@ elif init_from == 'pretrained':
     ckpt_config = checkpoint['config']
     vocab_size = checkpoint['model']['transformer.wte.weight'].shape[0]
 
+    if master_process:
+        print(f"\n{'='*60}")
+        print("CHECKPOINT DIAGNOSTICS")
+        print(f"{'='*60}")
+        print(f"Checkpoint keys: {list(checkpoint.keys())}")
+        print(f"Checkpoint config: {ckpt_config}")
+        print(f"Vocab size from weights: {vocab_size}")
+        print(
+            f"Number of weight tensors in checkpoint: {len(checkpoint['model'])}")
+        # Print a few sample checkpoint keys
+        ckpt_keys = list(checkpoint['model'].keys())[:10]
+        print(f"Sample checkpoint weight keys: {ckpt_keys}")
+        if 'best_val_loss' in checkpoint:
+            print(
+                f"Checkpoint best_val_loss: {checkpoint['best_val_loss']:.4f}")
+        if 'iter_num' in checkpoint:
+            print(f"Checkpoint iter_num: {checkpoint['iter_num']}")
+        print(f"{'='*60}\n")
+
     # Update model_args with checkpoint values
     model_args.update({
         'vocab_size': vocab_size,
@@ -222,17 +241,66 @@ elif init_from == 'pretrained':
     gptconf = GPTWithLTPConfig(**model_args)
     model = GPTWithLTP(gptconf)
 
+    if master_process:
+        print(f"Model state dict keys: {len(model.state_dict())}")
+        model_keys = list(model.state_dict().keys())[:10]
+        print(f"Sample model weight keys: {model_keys}")
+
     # Load pretrained weights (strict=False allows new pruning params)
     result = model.load_state_dict(checkpoint['model'], strict=False)
     if master_process:
         print(
-            f"Loaded {len(model.state_dict()) - len(result.missing_keys)} pretrained parameters")
-        print(f"Initialized {len(result.missing_keys)} new pruning parameters")
+            f"\nLoaded {len(model.state_dict()) - len(result.missing_keys)} pretrained parameters")
+        print(f"Missing keys (new params): {len(result.missing_keys)}")
+        print(
+            f"Unexpected keys (in ckpt but not model): {len(result.unexpected_keys)}")
         if result.missing_keys:
-            print(
-                f"New parameters: {[k for k in result.missing_keys if 'threshold' in k]}")
+            print(f"Missing keys: {result.missing_keys[:20]}")
+        if result.unexpected_keys:
+            print(f"Unexpected keys: {result.unexpected_keys[:20]}")
+
+        # Verify some weights are non-zero and look reasonable
+        wte = model.transformer.wte.weight
+        print(f"\nWeight verification:")
+        print(f"  wte.weight: mean={wte.mean().item():.6f}, std={wte.std().item():.6f}, "
+              f"min={wte.min().item():.6f}, max={wte.max().item():.6f}")
+        h0_attn = model.transformer.h[0].attn.c_attn.weight
+        print(
+            f"  h[0].attn.c_attn.weight: mean={h0_attn.mean().item():.6f}, std={h0_attn.std().item():.6f}")
 
 model.to(device)
+
+# DIAGNOSTIC: Immediate validation check after loading model
+if master_process and init_from == 'pretrained':
+    print(f"\n{'='*60}")
+    print("IMMEDIATE VALIDATION CHECK (before any training setup)")
+    print(f"{'='*60}")
+    model.eval()
+
+    # Quick validation on a few batches
+    val_losses = []
+    with torch.no_grad():
+        for _ in range(10):  # Just 10 batches for quick check
+            X, Y = get_batch('val')
+            with ctx:
+                logits, loss = model(X, Y)
+            val_losses.append(loss.item())
+
+    avg_val_loss = sum(val_losses) / len(val_losses)
+    print(f"Immediate validation loss (10 batches): {avg_val_loss:.4f}")
+    print(f"Expected for pretrained GPT-2 on WT2: ~3.0-4.0")
+
+    if avg_val_loss > 10.0:
+        print("\n⚠️  WARNING: Loss is very high!")
+        print("This suggests either:")
+        print("  1. The baseline checkpoint wasn't properly trained")
+        print("  2. There's a weight loading mismatch")
+        print("  3. Data/tokenization mismatch with the model")
+    elif avg_val_loss < 5.0:
+        print("\n✓ Loss looks reasonable for a pretrained model")
+
+    print(f"{'='*60}\n")
+    model.train()
 
 # Freeze all parameters except threshold parameters (only when token pruning is enabled)
 # This allows us to learn optimal pruning thresholds without modifying pretrained weights

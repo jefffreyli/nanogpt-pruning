@@ -2,6 +2,7 @@
 Full training loop for LTP model with Learned Token Pruning.
 
 Usage:
+    export PYTHONPATH="$PWD:$PYTHONPATH"
     python experiment/training/train_ltp.py config/train_ltp_wt2.py
 """
 

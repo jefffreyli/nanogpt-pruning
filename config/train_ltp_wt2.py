@@ -1,68 +1,81 @@
 # LTP (Learned Token Pruning) training on WikiText-2
-# This config trains LTP from a pretrained GPT-2 checkpoint
+# This config trains LTP from a pretrained GPT-2 checkpoint.
 
 # where to store checkpoints
-out_dir = 'out-ltp-wt2'
+out_dir = "out-ltp-wt2"
 
 # data
-dataset = 'wikitext2'
+dataset = "wikitext2"
 
 # Initialize from pretrained GPT-2 baseline and add LTP pruning
 # Options:
-#   'pretrained' - Load baseline_ckpt.pt and add pruning parameters (recommended)
-#   'scratch'    - Train LTP model from random initialization
-#   'resume'     - Resume from existing LTP checkpoint
-init_from = 'pretrained'
+#   'pretrained' - load baseline_ckpt.pt and add pruning parameters
+#   'scratch'    - train LTP model from random initialization
+#   'resume'     - resume from existing LTP checkpoint
+init_from = "pretrained"
 
-# logging
-wandb_log = False
-wandb_project = 'nanogpt-ltp'
-wandb_run_name = 'ltp-wt2'
-
-# batch / sequence (match baseline)
+# batch / sequence
 batch_size = 8
 block_size = 512
-gradient_accumulation_steps = 8  # 8*8*512 ≈ 32k tokens/iter
+gradient_accumulation_steps = 8  # 8*8*512 ≈ 32k tokens per step
 
-# model size (GPT-2 small)
+# GPT-2 small
 n_layer = 12
 n_head = 12
 n_embd = 768
 dropout = 0.0
 bias = True
 
-# LTP-specific parameters
+# LTP-specific knobs (high-level)
 use_token_pruning = True
-pruning_temperature = 0.01  # Temperature for soft pruning mask
-lambda_sparsity = 0.1       # Sparsity regularization weight
-# Importance scoring method for causal attention
-# Options: 'naive_col' (original, biased), 'row', 'causal_col' (recommended), 'future_aware'
-importance_method = 'causal_col'
+pruning_temperature = 5.0    # temperature for soft pruning mask
+lambda_sparsity = 0.01        # sparsity regularization weight
 
-# Evaluation only mode - set to True to just evaluate without training
-eval_only = False
+# how aggressively to protect the tail
+protected_tail_tokens = 128   # last 128 tokens never pruned
 
-# train length / lr
-max_iters = 1000
-learning_rate = 1e-4
-weight_decay = 0.1
+# training schedule
+learning_rate = 3e-4
+max_iters = 10000
+weight_decay = 0.01
+beta1 = 0.9
+beta2 = 0.95
+grad_clip = 1.0
 
-# warmup and decay
-warmup_iters = 100
-lr_decay_iters = 1000
-min_lr = 3e-5
+# LR decay
 decay_lr = True
+warmup_iters = 1000
+lr_decay_iters = max_iters
+min_lr = 3e-5
 
-# evaluation and logging
+# eval & logging
 eval_interval = 100
 log_interval = 10
 eval_iters = 200
 always_save_checkpoint = True
 
-# optimizer
-beta1 = 0.9
-beta2 = 0.95
-grad_clip = 1.0
-
 # system
 compile = False  # torch.compile can be finicky with custom models
+
+
+# ---------------------------------------------------------------------------
+# Map config variables to what train_ltp.py / GPTConfigLTP expect
+# ---------------------------------------------------------------------------
+
+# Enable or disable pruning
+prune_mode = "learned" if use_token_pruning else "none"
+
+# Stage 1 vs Stage 2:
+#   - Stage 1: masking_mode = 'soft'  (learn thresholds with soft masks)
+#   - Stage 2: set masking_mode = 'hard' and init_from = 'resume'
+masking_mode = "soft"
+
+# Temperature and sparsity regularization for soft masks
+temperature = pruning_temperature
+lambda_factor = lambda_sparsity
+
+# Global threshold scale (used by per-layer learnable thresholds)
+final_token_threshold = 0.01
+
+# Number of tail tokens that are never pruned (LM loss stability)
+min_keep_tokens = protected_tail_tokens

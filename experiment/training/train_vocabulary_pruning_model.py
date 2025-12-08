@@ -46,7 +46,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 
 # --- Dynamic Vocabulary Pruning Config ---
 pruning_layer = 3       # Layer to use for determining active vocabulary
-pruning_topk = 500      # Number of tokens to keep active
+pruning_topk = 10000      # Number of tokens to keep active
 aux_loss_weight = 0.1   # Weight for the auxiliary loss on the pruning layer. 
                         # Set to 0.0 to disable. 0.1-0.3 is usually good for training.
 

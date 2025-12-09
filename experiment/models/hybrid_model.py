@@ -299,8 +299,12 @@ class TokenPolicy(nn.Module):
         )
 
     def forward(self, h):
-        logits = self.net(h)
+        # Run in float32 to avoid mixed-precision numerical issues
+        h_float = h.float()
+        logits = self.net(h_float)
         probs = torch.sigmoid(logits)
+        # Clamp to valid probability range for torch.bernoulli
+        probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)
         return probs.squeeze(-1)
 
 
@@ -476,6 +480,9 @@ class GPTHybrid(nn.Module):
                 policy = self.policies[str(layer_idx)]
                 probs = policy(prev_x)
 
+                # Ensure probs are valid for bernoulli (handles any remaining numerical issues)
+                probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)
+
                 if policy_training and self.training:
                     # Sample Bernoulli actions
                     actions = torch.bernoulli(probs).bool()
@@ -484,10 +491,12 @@ class GPTHybrid(nn.Module):
                     # Once dead, always dead
                     actions = alive & actions
 
-                    # log π(a|s)
+                    # log π(a|s) with numerical stability
+                    log_probs = torch.log(probs)
+                    log_one_minus_probs = torch.log(1.0 - probs)
                     log_p = (
-                        actions.float() * torch.log(probs + 1e-8) +
-                        (1.0 - actions.float()) * torch.log(1.0 - probs + 1e-8)
+                        actions.float() * log_probs +
+                        (1.0 - actions.float()) * log_one_minus_probs
                     )
                     policy_logprobs.append(log_p.sum(dim=1))
                 else:

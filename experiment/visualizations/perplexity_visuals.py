@@ -6,42 +6,73 @@ This script analyzes and visualizes perplexity metrics between:
 2. LTP (Learned Token Pruning) model
 3. Dynamic Token Reduction model
 
-It creates line graphs showing relationships across different configurations
-(e.g., sequence length, model size) to reveal deeper insights.
+python experiment/visualizations/perplexity_visuals.py
 """
-
 import os
 import sys
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import pickle
 from typing import Dict, List, Optional, Tuple
 
 # Add parent directories to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from experiment.models.ltp_model import GPTLTP, GPTConfigLTP
 from experiment.models.dynamic_token_reduction_model import GPT as DynamicTRGPT, GPTConfig as DynamicTRGPTConfig
 from model import GPT as BaselineGPT, GPTConfig as BaselineGPTConfig
 
+def load_wikitext2_data(data_dir: str = "data/wikitext2"):
+    """
+    Load WikiText-2 validation data.
+
+    Args:
+        data_dir: Directory containing WikiText-2 data files
+
+    Returns:
+        Tuple of (val_data, vocab_size)
+    """
+    project_root = os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))
+    full_data_dir = os.path.join(project_root, data_dir)
+
+    val_path = os.path.join(full_data_dir, "val.bin")
+    if not os.path.exists(val_path):
+        raise FileNotFoundError(
+            f"WikiText-2 validation data not found at {val_path}")
+
+    val_data = np.memmap(val_path, dtype=np.uint16, mode='r')
+
+    # Load vocab size from meta.pkl if available
+    meta_path = os.path.join(full_data_dir, "meta.pkl")
+    vocab_size = 50304  # default
+    if os.path.exists(meta_path):
+        with open(meta_path, 'rb') as f:
+            meta = pickle.load(f)
+        vocab_size = meta.get('vocab_size', 50304)
+
+    return val_data, vocab_size
+
 
 def evaluate_perplexity(
     model: torch.nn.Module,
-    num_batches: int = 10,
-    batch_size: int = 4,
-    block_size: int = 256,
-    vocab_size: int = 50304,
+    val_data: np.ndarray,
+    num_batches: int = 50,
+    batch_size: int = 8,
+    block_size: int = 512,
     device: str = "cpu",
 ) -> Tuple[float, float]:
     """
-    Evaluate perplexity on multiple batches of random data.
+    Evaluate perplexity on WikiText-2 validation data.
 
     Args:
         model: The model to evaluate
+        val_data: WikiText-2 validation data (numpy memmap)
         num_batches: Number of batches to evaluate on
         batch_size: Batch size for evaluation
         block_size: Sequence length
-        vocab_size: Vocabulary size
         device: Device to run evaluation on
 
     Returns:
@@ -51,18 +82,23 @@ def evaluate_perplexity(
     model.to(device)
 
     total_loss = 0.0
-    total_perplexity = 0.0
 
     with torch.no_grad():
         for _ in range(num_batches):
-            # Generate random input and target sequences
-            idx = torch.randint(
-                0, vocab_size, (batch_size, block_size), device=device)
-            targets = torch.randint(
-                0, vocab_size, (batch_size, block_size), device=device)
+            # Sample random positions from validation data
+            ix = torch.randint(len(val_data) - block_size, (batch_size,))
+
+            # Load actual WikiText-2 sequences
+            x = torch.stack(
+                [torch.from_numpy(val_data[i:i+block_size].astype(np.int64)) for i in ix])
+            y = torch.stack(
+                [torch.from_numpy(val_data[i+1:i+1+block_size].astype(np.int64)) for i in ix])
+
+            x = x.to(device)
+            y = y.to(device)
 
             # Forward pass
-            result = model(idx, targets=targets)
+            result = model(x, targets=y)
 
             # Handle different return signatures
             if isinstance(result, tuple):
@@ -71,67 +107,62 @@ def evaluate_perplexity(
             else:
                 raise ValueError("Model output format not recognized")
 
-            # Calculate perplexity
-            perplexity = torch.exp(loss)
-
             total_loss += loss.item()
-            total_perplexity += perplexity.item()
 
     avg_loss = total_loss / num_batches
-    avg_perplexity = total_perplexity / num_batches
+    avg_perplexity = np.exp(avg_loss)
 
     return avg_loss, avg_perplexity
 
 
 def evaluate_ltp_model(
-    config: Optional[GPTConfigLTP] = None,
-    checkpoint_path: Optional[str] = None,
-    num_batches: int = 10,
+    checkpoint_path: str,
+    val_data: np.ndarray,
+    num_batches: int = 50,
     device: str = "cpu",
 ) -> Dict[str, float]:
     """
-    Evaluate LTP model perplexity.
+    Evaluate LTP model perplexity on WikiText-2 validation data.
 
     Args:
-        config: Model configuration (uses default if None)
-        checkpoint_path: Path to model checkpoint (optional)
+        checkpoint_path: Path to model checkpoint
+        val_data: WikiText-2 validation data
         num_batches: Number of batches for evaluation
         device: Device to run evaluation on
 
     Returns:
         Dictionary with loss and perplexity metrics
     """
-    if config is None:
-        config = GPTConfigLTP(
-            block_size=256,
-            vocab_size=50304,
-            n_layer=6,
-            n_head=6,
-            n_embd=384,
-            dropout=0.0,
-            bias=True,
-            prune_mode="learned",
-            final_token_threshold=0.01,
-            temperature=5.0,
-            masking_mode="hard",
-            lambda_factor=0.1,
-            min_keep_tokens=64,
-        )
+    if not os.path.exists(checkpoint_path):
+        print(f"Warning: Checkpoint not found at {checkpoint_path}")
+        return {
+            "loss": float('nan'),
+            "perplexity": float('nan'),
+            "model_name": "LTP (Learned Token Pruning)",
+        }
 
+    # Load checkpoint to get config
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model_args = checkpoint.get('model_args', {})
+
+    # Filter to only include LTP-specific parameters
+    ltp_keys = {'n_layer', 'n_head', 'n_embd', 'block_size', 'bias',
+                'vocab_size', 'dropout', 'prune_mode', 'final_token_threshold',
+                'temperature', 'masking_mode', 'lambda_factor', 'min_keep_tokens'}
+    filtered_args = {k: v for k, v in model_args.items() if k in ltp_keys}
+
+    # Create config from checkpoint
+    config = GPTConfigLTP(**filtered_args)
     model = GPTLTP(config)
-
-    # Load checkpoint if provided
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint["model"])
-        print(f"Loaded checkpoint from {checkpoint_path}")
+    model.load_state_dict(checkpoint["model"])
+    print(f"Loaded LTP checkpoint from {checkpoint_path}")
 
     loss, perplexity = evaluate_perplexity(
         model,
+        val_data,
         num_batches=num_batches,
-        batch_size=4,
+        batch_size=8,
         block_size=config.block_size,
-        vocab_size=config.vocab_size,
         device=device,
     )
 
@@ -143,48 +174,52 @@ def evaluate_ltp_model(
 
 
 def evaluate_baseline_model(
-    config: Optional[BaselineGPTConfig] = None,
-    checkpoint_path: Optional[str] = None,
-    num_batches: int = 10,
+    checkpoint_path: str,
+    val_data: np.ndarray,
+    num_batches: int = 50,
     device: str = "cpu",
 ) -> Dict[str, float]:
     """
-    Evaluate baseline GPT model perplexity.
+    Evaluate baseline GPT model perplexity on WikiText-2 validation data.
 
     Args:
-        config: Model configuration (uses default if None)
-        checkpoint_path: Path to model checkpoint (optional)
+        checkpoint_path: Path to model checkpoint
+        val_data: WikiText-2 validation data
         num_batches: Number of batches for evaluation
         device: Device to run evaluation on
 
     Returns:
         Dictionary with loss and perplexity metrics
     """
-    if config is None:
-        config = BaselineGPTConfig(
-            block_size=256,
-            vocab_size=50304,
-            n_layer=6,
-            n_head=6,
-            n_embd=384,
-            dropout=0.0,
-            bias=True,
-        )
+    if not os.path.exists(checkpoint_path):
+        print(f"Warning: Checkpoint not found at {checkpoint_path}")
+        return {
+            "loss": float('nan'),
+            "perplexity": float('nan'),
+            "model_name": "Baseline GPT",
+        }
 
+    # Load checkpoint to get config
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model_args = checkpoint.get('model_args', {})
+
+    # Filter out Dynamic TR-specific parameters that BaselineGPT doesn't accept
+    baseline_keys = {'n_layer', 'n_head', 'n_embd', 'block_size', 'bias',
+                     'vocab_size', 'dropout'}
+    filtered_args = {k: v for k, v in model_args.items() if k in baseline_keys}
+
+    # Create config from checkpoint
+    config = BaselineGPTConfig(**filtered_args)
     model = BaselineGPT(config)
-
-    # Load checkpoint if provided
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint["model"])
-        print(f"Loaded checkpoint from {checkpoint_path}")
+    model.load_state_dict(checkpoint["model"])
+    print(f"Loaded baseline checkpoint from {checkpoint_path}")
 
     loss, perplexity = evaluate_perplexity(
         model,
+        val_data,
         num_batches=num_batches,
-        batch_size=4,
+        batch_size=8,
         block_size=config.block_size,
-        vocab_size=config.vocab_size,
         device=device,
     )
 
@@ -196,53 +231,54 @@ def evaluate_baseline_model(
 
 
 def evaluate_dynamic_tr_model(
-    config: Optional[DynamicTRGPTConfig] = None,
-    checkpoint_path: Optional[str] = None,
-    num_batches: int = 10,
+    checkpoint_path: str,
+    val_data: np.ndarray,
+    num_batches: int = 50,
     device: str = "cpu",
 ) -> Dict[str, float]:
     """
-    Evaluate Dynamic Token Reduction model perplexity.
+    Evaluate Dynamic Token Reduction model perplexity on WikiText-2 validation data.
 
     Args:
-        config: Model configuration (uses default if None)
-        checkpoint_path: Path to model checkpoint (optional)
+        checkpoint_path: Path to model checkpoint
+        val_data: WikiText-2 validation data
         num_batches: Number of batches for evaluation
         device: Device to run evaluation on
 
     Returns:
         Dictionary with loss and perplexity metrics
     """
-    if config is None:
-        config = DynamicTRGPTConfig(
-            block_size=256,
-            vocab_size=50304,
-            n_layer=6,
-            n_head=6,
-            n_embd=384,
-            dropout=0.0,
-            bias=True,
-            use_token_reduction=True,
-            reduction_layers=(2, 4),
-            policy_hidden_dim=256,
-            lambda_tokens=1e-4,
-            rl_weight=0.1,
-        )
+    if not os.path.exists(checkpoint_path):
+        print(f"Warning: Checkpoint not found at {checkpoint_path}")
+        return {
+            "loss": float('nan'),
+            "perplexity": float('nan'),
+            "model_name": "Dynamic Token Reduction",
+        }
 
+    # Load checkpoint to get config
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model_args = checkpoint.get('model_args', {})
+
+    # Filter to only include Dynamic TR parameters
+    dynamic_tr_keys = {'n_layer', 'n_head', 'n_embd', 'block_size', 'bias',
+                       'vocab_size', 'dropout', 'use_token_reduction',
+                       'reduction_layers', 'policy_hidden_dim', 'lambda_tokens', 'rl_weight'}
+    filtered_args = {k: v for k, v in model_args.items()
+                     if k in dynamic_tr_keys}
+
+    # Create config from checkpoint
+    config = DynamicTRGPTConfig(**filtered_args)
     model = DynamicTRGPT(config)
-
-    # Load checkpoint if provided
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint["model"])
-        print(f"Loaded checkpoint from {checkpoint_path}")
+    model.load_state_dict(checkpoint["model"])
+    print(f"Loaded Dynamic TR checkpoint from {checkpoint_path}")
 
     loss, perplexity = evaluate_perplexity(
         model,
+        val_data,
         num_batches=num_batches,
-        batch_size=4,
+        batch_size=8,
         block_size=config.block_size,
-        vocab_size=config.vocab_size,
         device=device,
     )
 
@@ -254,41 +290,47 @@ def evaluate_dynamic_tr_model(
 
 
 def compare_models(
-    baseline_config: Optional[BaselineGPTConfig] = None,
-    ltp_config: Optional[GPTConfigLTP] = None,
-    dynamic_tr_config: Optional[DynamicTRGPTConfig] = None,
-    baseline_checkpoint: Optional[str] = None,
-    ltp_checkpoint: Optional[str] = None,
-    dynamic_tr_checkpoint: Optional[str] = None,
-    num_batches: int = 10,
+    baseline_checkpoint: str,
+    ltp_checkpoint: str,
+    dynamic_tr_checkpoint: str,
+    val_data: np.ndarray,
+    num_batches: int = 50,
     device: str = "cpu",
 ) -> Dict[str, Dict[str, float]]:
     """
-    Compare perplexity between Baseline, LTP, and Dynamic Token Reduction models.
+    Compare perplexity between Baseline, LTP, and Dynamic Token Reduction models on WikiText-2.
+
+    Args:
+        baseline_checkpoint: Path to baseline model checkpoint
+        ltp_checkpoint: Path to LTP model checkpoint
+        dynamic_tr_checkpoint: Path to Dynamic TR model checkpoint
+        val_data: WikiText-2 validation data
+        num_batches: Number of batches to evaluate
+        device: Device to run on
 
     Returns:
         Dictionary with results for all three models
     """
     print("Evaluating Baseline GPT model...")
     baseline_results = evaluate_baseline_model(
-        config=baseline_config,
         checkpoint_path=baseline_checkpoint,
+        val_data=val_data,
         num_batches=num_batches,
         device=device,
     )
 
     print("\nEvaluating LTP model...")
     ltp_results = evaluate_ltp_model(
-        config=ltp_config,
         checkpoint_path=ltp_checkpoint,
+        val_data=val_data,
         num_batches=num_batches,
         device=device,
     )
 
     print("\nEvaluating Dynamic Token Reduction model...")
     dynamic_tr_results = evaluate_dynamic_tr_model(
-        config=dynamic_tr_config,
         checkpoint_path=dynamic_tr_checkpoint,
+        val_data=val_data,
         num_batches=num_batches,
         device=device,
     )
@@ -301,16 +343,25 @@ def compare_models(
 
 
 def analyze_perplexity_vs_sequence_length(
+    baseline_checkpoint: str,
+    ltp_checkpoint: str,
+    dynamic_tr_checkpoint: str,
+    val_data: np.ndarray,
     sequence_lengths: List[int] = None,
-    num_batches: int = 5,
+    num_batches: int = 20,
     device: str = "cpu",
     save_path: Optional[str] = None,
     show_plot: bool = True,
 ) -> None:
     """
-    Create line graphs showing how perplexity scales with sequence length.
+    Create line graphs showing how perplexity scales with sequence length
+    for trained models evaluated on WikiText-2.
 
     Args:
+        baseline_checkpoint: Path to baseline checkpoint
+        ltp_checkpoint: Path to LTP checkpoint
+        dynamic_tr_checkpoint: Path to Dynamic TR checkpoint
+        val_data: WikiText-2 validation data
         sequence_lengths: List of sequence lengths to test
         num_batches: Number of batches for evaluation
         device: Device to run evaluation on
@@ -318,71 +369,94 @@ def analyze_perplexity_vs_sequence_length(
         show_plot: Whether to display the plot
     """
     if sequence_lengths is None:
-        sequence_lengths = [64, 128, 256, 512, 1024]
+        sequence_lengths = [64, 128, 256, 512]
 
     baseline_perplexities = []
     ltp_perplexities = []
     dynamic_tr_perplexities = []
 
-    print("Analyzing perplexity vs sequence length...")
+    print("Analyzing perplexity vs sequence length (trained models on WikiText-2)...")
+
+    # Load all models once with their original block_size from checkpoints
+    baseline_model = None
+    ltp_model = None
+    dynamic_tr_model = None
+
+    # Load Baseline model
+    if os.path.exists(baseline_checkpoint):
+        print("  Loading Baseline model...")
+        baseline_ckpt = torch.load(baseline_checkpoint, map_location=device)
+        model_args = baseline_ckpt.get('model_args', {})
+        baseline_keys = {'n_layer', 'n_head', 'n_embd', 'block_size',
+                         'bias', 'vocab_size', 'dropout'}
+        filtered_args = {k: v for k, v in model_args.items()
+                         if k in baseline_keys}
+        config = BaselineGPTConfig(**filtered_args)
+        baseline_model = BaselineGPT(config)
+        baseline_model.load_state_dict(baseline_ckpt["model"])
+        baseline_model.to(device)
+        baseline_model.eval()
+
+    # Load LTP model
+    if os.path.exists(ltp_checkpoint):
+        print("  Loading LTP model...")
+        ltp_ckpt = torch.load(ltp_checkpoint, map_location=device)
+        model_args = ltp_ckpt.get('model_args', {})
+        ltp_keys = {'n_layer', 'n_head', 'n_embd', 'block_size', 'bias',
+                    'vocab_size', 'dropout', 'prune_mode', 'final_token_threshold',
+                    'temperature', 'masking_mode', 'lambda_factor', 'min_keep_tokens'}
+        filtered_args = {k: v for k, v in model_args.items() if k in ltp_keys}
+        config = GPTConfigLTP(**filtered_args)
+        ltp_model = GPTLTP(config)
+        ltp_model.load_state_dict(ltp_ckpt["model"])
+        ltp_model.to(device)
+        ltp_model.eval()
+
+    # Load Dynamic TR model
+    if os.path.exists(dynamic_tr_checkpoint):
+        print("  Loading Dynamic TR model...")
+        dynamic_tr_ckpt = torch.load(
+            dynamic_tr_checkpoint, map_location=device)
+        model_args = dynamic_tr_ckpt.get('model_args', {})
+        dynamic_tr_keys = {'n_layer', 'n_head', 'n_embd', 'block_size', 'bias',
+                           'vocab_size', 'dropout', 'use_token_reduction',
+                           'reduction_layers', 'policy_hidden_dim', 'lambda_tokens',
+                           'rl_weight'}
+        filtered_args = {k: v for k, v in model_args.items()
+                         if k in dynamic_tr_keys}
+        config = DynamicTRGPTConfig(**filtered_args)
+        dynamic_tr_model = DynamicTRGPT(config)
+        dynamic_tr_model.load_state_dict(dynamic_tr_ckpt["model"])
+        dynamic_tr_model.to(device)
+        dynamic_tr_model.eval()
+
+    # Evaluate each model on different sequence lengths
     for seq_len in sequence_lengths:
         print(f"  Evaluating sequence length: {seq_len}")
 
         # Baseline
-        baseline_config = BaselineGPTConfig(
-            block_size=seq_len,
-            vocab_size=50304,
-            n_layer=6,
-            n_head=6,
-            n_embd=384,
-            dropout=0.0,
-            bias=True,
-        )
-        baseline_result = evaluate_baseline_model(
-            config=baseline_config, num_batches=num_batches, device=device
-        )
-        baseline_perplexities.append(baseline_result["perplexity"])
+        if baseline_model is not None:
+            loss, ppl = evaluate_perplexity(
+                baseline_model, val_data, num_batches, 8, seq_len, device)
+            baseline_perplexities.append(ppl)
+        else:
+            baseline_perplexities.append(float('nan'))
 
         # LTP
-        ltp_config = GPTConfigLTP(
-            block_size=seq_len,
-            vocab_size=50304,
-            n_layer=6,
-            n_head=6,
-            n_embd=384,
-            dropout=0.0,
-            bias=True,
-            prune_mode="learned",
-            final_token_threshold=0.01,
-            temperature=5.0,
-            masking_mode="hard",
-            lambda_factor=0.1,
-            min_keep_tokens=min(64, seq_len // 4),
-        )
-        ltp_result = evaluate_ltp_model(
-            config=ltp_config, num_batches=num_batches, device=device
-        )
-        ltp_perplexities.append(ltp_result["perplexity"])
+        if ltp_model is not None:
+            loss, ppl = evaluate_perplexity(
+                ltp_model, val_data, num_batches, 8, seq_len, device)
+            ltp_perplexities.append(ppl)
+        else:
+            ltp_perplexities.append(float('nan'))
 
         # Dynamic TR
-        dynamic_tr_config = DynamicTRGPTConfig(
-            block_size=seq_len,
-            vocab_size=50304,
-            n_layer=6,
-            n_head=6,
-            n_embd=384,
-            dropout=0.0,
-            bias=True,
-            use_token_reduction=True,
-            reduction_layers=(2, 4),
-            policy_hidden_dim=256,
-            lambda_tokens=1e-4,
-            rl_weight=0.1,
-        )
-        dynamic_tr_result = evaluate_dynamic_tr_model(
-            config=dynamic_tr_config, num_batches=num_batches, device=device
-        )
-        dynamic_tr_perplexities.append(dynamic_tr_result["perplexity"])
+        if dynamic_tr_model is not None:
+            loss, ppl = evaluate_perplexity(
+                dynamic_tr_model, val_data, num_batches, 8, seq_len, device)
+            dynamic_tr_perplexities.append(ppl)
+        else:
+            dynamic_tr_perplexities.append(float('nan'))
 
     # Create line plot
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -418,147 +492,6 @@ def analyze_perplexity_vs_sequence_length(
     ax.set_xlabel("Sequence Length", fontsize=12, fontweight="bold")
     ax.set_ylabel("Perplexity", fontsize=12, fontweight="bold")
     ax.set_title("Perplexity vs Sequence Length",
-                 fontsize=14, fontweight="bold")
-    ax.legend(fontsize=11)
-    ax.grid(alpha=0.3, linestyle="--")
-    ax.set_yscale("log")
-
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        print(f"\nFigure saved to {save_path}")
-
-    if show_plot:
-        plt.show()
-    else:
-        plt.close()
-
-
-def analyze_perplexity_vs_model_size(
-    n_layers_list: List[int] = None,
-    num_batches: int = 5,
-    device: str = "cpu",
-    save_path: Optional[str] = None,
-    show_plot: bool = True,
-) -> None:
-    """
-    Create line graphs showing how perplexity changes with model size (number of layers).
-
-    Args:
-        n_layers_list: List of number of layers to test
-        num_batches: Number of batches for evaluation
-        device: Device to run evaluation on
-        save_path: Path to save the figure (optional)
-        show_plot: Whether to display the plot
-    """
-    if n_layers_list is None:
-        n_layers_list = [4, 6, 8, 10, 12]
-
-    baseline_perplexities = []
-    ltp_perplexities = []
-    dynamic_tr_perplexities = []
-
-    print("Analyzing perplexity vs model size (number of layers)...")
-    for n_layer in n_layers_list:
-        print(f"  Evaluating {n_layer} layers")
-
-        # Baseline
-        baseline_config = BaselineGPTConfig(
-            block_size=256,
-            vocab_size=50304,
-            n_layer=n_layer,
-            n_head=6,
-            n_embd=384,
-            dropout=0.0,
-            bias=True,
-        )
-        baseline_result = evaluate_baseline_model(
-            config=baseline_config, num_batches=num_batches, device=device
-        )
-        baseline_perplexities.append(baseline_result["perplexity"])
-
-        # LTP
-        ltp_config = GPTConfigLTP(
-            block_size=256,
-            vocab_size=50304,
-            n_layer=n_layer,
-            n_head=6,
-            n_embd=384,
-            dropout=0.0,
-            bias=True,
-            prune_mode="learned",
-            final_token_threshold=0.01,
-            temperature=5.0,
-            masking_mode="hard",
-            lambda_factor=0.1,
-            min_keep_tokens=64,
-        )
-        ltp_result = evaluate_ltp_model(
-            config=ltp_config, num_batches=num_batches, device=device
-        )
-        ltp_perplexities.append(ltp_result["perplexity"])
-
-        # Dynamic TR
-        reduction_layers = tuple(
-            [i for i in range(1, n_layer) if i % (n_layer // 3) == 0][:2]
-        )
-        if not reduction_layers:
-            reduction_layers = (n_layer // 3, 2 * n_layer // 3)
-
-        dynamic_tr_config = DynamicTRGPTConfig(
-            block_size=256,
-            vocab_size=50304,
-            n_layer=n_layer,
-            n_head=6,
-            n_embd=384,
-            dropout=0.0,
-            bias=True,
-            use_token_reduction=True,
-            reduction_layers=reduction_layers,
-            policy_hidden_dim=256,
-            lambda_tokens=1e-4,
-            rl_weight=0.1,
-        )
-        dynamic_tr_result = evaluate_dynamic_tr_model(
-            config=dynamic_tr_config, num_batches=num_batches, device=device
-        )
-        dynamic_tr_perplexities.append(dynamic_tr_result["perplexity"])
-
-    # Create line plot
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    ax.plot(
-        n_layers_list,
-        baseline_perplexities,
-        marker="o",
-        linewidth=2,
-        markersize=8,
-        label="Baseline GPT",
-        color="#1f77b4",
-    )
-    ax.plot(
-        n_layers_list,
-        ltp_perplexities,
-        marker="s",
-        linewidth=2,
-        markersize=8,
-        label="LTP (Learned Token Pruning)",
-        color="#2E86AB",
-    )
-    ax.plot(
-        n_layers_list,
-        dynamic_tr_perplexities,
-        marker="^",
-        linewidth=2,
-        markersize=8,
-        label="Dynamic Token Reduction",
-        color="#A23B72",
-    )
-
-    ax.set_xlabel("Number of Layers", fontsize=12, fontweight="bold")
-    ax.set_ylabel("Perplexity", fontsize=12, fontweight="bold")
-    ax.set_title("Perplexity vs Model Size (Number of Layers)",
                  fontsize=14, fontweight="bold")
     ax.legend(fontsize=11)
     ax.grid(alpha=0.3, linestyle="--")
@@ -784,16 +717,45 @@ def main():
     torch.manual_seed(42)
     np.random.seed(42)
 
-    # Compare models with default configurations
+    # Get project root
+    project_root = os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))
+
+    # Load WikiText-2 validation data
+    print("Loading WikiText-2 validation data...")
+    try:
+        val_data, vocab_size = load_wikitext2_data()
+        print(
+            f"Loaded validation data: {len(val_data):,} tokens, vocab_size={vocab_size}\n")
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        print("Please prepare WikiText-2 data first.")
+        return
+
+    # Define checkpoint paths
+    baseline_checkpoint = os.path.join(
+        project_root, "out-baseline-wt2", "baseline.pt")
+    ltp_checkpoint = os.path.join(project_root, "out-ltp-wt2", "ltp_ckpt.pt")
+    dynamic_tr_checkpoint = os.path.join(
+        project_root, "out-dynamic-tr-wt2", "rl_ckpt.pt")
+
+    # Compare models on WikiText-2 validation data
     print("=" * 60)
     print("PERPLEXITY ANALYSIS: Baseline vs LTP vs Dynamic Token Reduction")
     print("=" * 60)
 
-    results = compare_models(num_batches=10, device=device)
+    results = compare_models(
+        baseline_checkpoint=baseline_checkpoint,
+        ltp_checkpoint=ltp_checkpoint,
+        dynamic_tr_checkpoint=dynamic_tr_checkpoint,
+        val_data=val_data,
+        num_batches=50,
+        device=device
+    )
 
     # Print results
     print("\n" + "=" * 60)
-    print("RESULTS SUMMARY")
+    print("RESULTS SUMMARY (WikiText-2 Validation Set)")
     print("=" * 60)
     for model_key, model_results in results.items():
         print(f"\n{model_results['model_name']}:")
@@ -806,39 +768,41 @@ def main():
     print("=" * 60)
 
     output_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))))
 
     # Training curves from checkpoints
     print("\n--- Training Curves from Checkpoints ---")
     checkpoint_paths = {
-        'baseline': os.path.join(project_root, "out-baseline-wt2", "baseline_ckpt.pt"),
-        'ltp': os.path.join(project_root, "out-ltp-wt2", "ckpt.pt"),
-        'dynamic_tr': os.path.join(project_root, "out-dynamic-tr", "ckpt.pt"),
+        'baseline': baseline_checkpoint,
+        'ltp': ltp_checkpoint,
+        'dynamic_tr': dynamic_tr_checkpoint,
     }
 
-    plot_training_curves(
-        checkpoint_paths=checkpoint_paths,
-        save_dir=output_dir,
-        show_plot=False
-    )
+    # plot_training_curves(
+    #     checkpoint_paths=checkpoint_paths,
+    #     save_dir=output_dir,
+    #     show_plot=False
+    # )
 
-    # Perplexity vs sequence length
-    print("\n--- Perplexity vs Sequence Length ---")
+    # Perplexity vs sequence length (trained models)
+    print("\n--- Perplexity vs Sequence Length (Trained Models) ---")
     seq_len_path = os.path.join(
         output_dir, "perplexity_vs_sequence_length.png")
     analyze_perplexity_vs_sequence_length(
-        num_batches=5, device=device, save_path=seq_len_path, show_plot=False
-    )
-
-    # Perplexity vs model size
-    print("\n--- Perplexity vs Model Size ---")
-    model_size_path = os.path.join(output_dir, "perplexity_vs_model_size.png")
-    analyze_perplexity_vs_model_size(
-        num_batches=5, device=device, save_path=model_size_path, show_plot=False
+        baseline_checkpoint=baseline_checkpoint,
+        ltp_checkpoint=ltp_checkpoint,
+        dynamic_tr_checkpoint=dynamic_tr_checkpoint,
+        val_data=val_data,
+        sequence_lengths=[64, 128, 256, 512],
+        num_batches=20,
+        device=device,
+        save_path=seq_len_path,
+        show_plot=False
     )
 
     print("\nAnalysis complete!")
+    print(f"\nVisualizations saved to:")
+    print(f"  - {output_dir}/training_curves.png")
+    print(f"  - {output_dir}/perplexity_vs_sequence_length.png")
 
 
 if __name__ == "__main__":

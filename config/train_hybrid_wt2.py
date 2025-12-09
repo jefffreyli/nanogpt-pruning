@@ -50,15 +50,18 @@ bias = True
 # -----------------------------------------------------------------------------
 reduction_layers = (4, 8)       # Layers where RL policies prune tokens
 policy_hidden_dim = 256         # Hidden dim for policy network
-lambda_tokens = 1e-4            # Penalty on number of selected tokens
-rl_weight = 0.1                 # Weight of RL loss vs LM loss
+# Penalty on number of selected tokens (lowered for stability)
+lambda_tokens = 1e-5
+# Weight of RL loss vs LM loss (lowered to prevent NaN)
+rl_weight = 0.01
 
 # -----------------------------------------------------------------------------
 # Learned Token Pruning (LTP) - applied in LATER layers
 # -----------------------------------------------------------------------------
 ltp_layers = (9, 10, 11)        # Layers where LTP prunes tokens
 final_token_threshold = 0.01   # Global scale for per-layer thresholds
-temperature = 5.0              # Temperature for soft pruning mask
+# Temperature for soft pruning mask (lowered from 5.0 for stability)
+temperature = 1.0
 masking_mode = 'soft'          # 'soft' for training, 'hard' for inference
 lambda_factor = 0.1            # Sparsity regularization weight
 # Last N tokens never pruned (for LM loss stability)
@@ -75,11 +78,11 @@ gradient_accumulation_steps = 8  # Effective batch: 8 * 8 * 512 = 32k tokens
 # Training schedule
 # -----------------------------------------------------------------------------
 # Stage 1 (LTP): longer training with higher LR
-# Stage 2 (RL):  shorter fine-tuning with lower LR
+# Stage 2 (RL):  shorter fine-tuning with much lower LR (prevents gradient explosion)
 if rl_stage:
-    max_iters = 300
-    learning_rate = 1e-4
-    warmup_iters = 30
+    max_iters = 500
+    learning_rate = 1e-5          # Much lower LR for RL stability
+    warmup_iters = 50
 else:
     max_iters = 300
     learning_rate = 3e-4

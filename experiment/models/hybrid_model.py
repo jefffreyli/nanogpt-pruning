@@ -301,12 +301,15 @@ class TokenPolicy(nn.Module):
     def forward(self, h):
         # Disable autocast and run in float32 to avoid mixed-precision numerical issues
         # This is critical for RL training where bernoulli sampling requires valid [0,1] probs
-        with torch.amp.autocast(device_type='cuda', enabled=False):
+        device_type = 'cuda' if h.is_cuda else 'cpu'
+        with torch.amp.autocast(device_type=device_type, enabled=False):
             h_float = h.float()
             logits = self.net(h_float)
+            # Clamp logits to prevent overflow in sigmoid
+            logits = torch.clamp(logits, -20.0, 20.0)
             probs = torch.sigmoid(logits)
             # Clamp to valid probability range for torch.bernoulli
-            probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)
+            probs = torch.clamp(probs, 1e-6, 1.0 - 1e-6)
         return probs.squeeze(-1)
 
 
@@ -483,7 +486,7 @@ class GPTHybrid(nn.Module):
                 probs = policy(prev_x)
 
                 # Ensure probs are valid for bernoulli (handles any remaining numerical issues)
-                probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)
+                probs = torch.clamp(probs, 1e-6, 1.0 - 1e-6)
 
                 if policy_training and self.training:
                     # Sample Bernoulli actions
@@ -494,8 +497,10 @@ class GPTHybrid(nn.Module):
                     actions = alive & actions
 
                     # log π(a|s) with numerical stability
-                    log_probs = torch.log(probs)
-                    log_one_minus_probs = torch.log(1.0 - probs)
+                    # Clamp log probs to prevent extreme gradients
+                    log_probs = torch.clamp(torch.log(probs), min=-20.0)
+                    log_one_minus_probs = torch.clamp(
+                        torch.log(1.0 - probs), min=-20.0)
                     log_p = (
                         actions.float() * log_probs +
                         (1.0 - actions.float()) * log_one_minus_probs

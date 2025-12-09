@@ -355,6 +355,7 @@ raw_model = model.module if ddp else model
 def compute_total_loss(lm_loss, rl_info, seq_len, raw_model):
     """
     Combine LM loss with RL policy gradient loss.
+    Added numerical stability: clamp log probs, check for NaN.
     """
     policy_logprobs = rl_info["policy_logprobs"]
     num_selected_tokens = rl_info["num_selected_tokens"]
@@ -368,6 +369,9 @@ def compute_total_loss(lm_loss, rl_info, seq_len, raw_model):
     L = logp.size(0)
     T = seq_len
 
+    # Clamp log probs to prevent extreme values
+    logp = torch.clamp(logp, min=-100.0, max=0.0)
+
     logp_total = logp.sum(dim=0) / (L * T)
     frac_selected = selected.sum(dim=0) / (L * T)
     avg_frac = frac_selected.mean().item()
@@ -380,8 +384,17 @@ def compute_total_loss(lm_loss, rl_info, seq_len, raw_model):
         base = base.expand_as(frac_selected)
         reward = base - lam * frac_selected
         reward = reward - reward.mean()
+        # Normalize reward for stability
+        reward_std = reward.std() + 1e-8
+        reward = reward / reward_std
 
     policy_loss = -(reward * logp_total).mean()
+
+    # Check for NaN and skip RL loss if detected
+    if torch.isnan(policy_loss) or torch.isinf(policy_loss):
+        print("Warning: NaN/Inf detected in policy_loss, using only LM loss")
+        return lm_loss, avg_frac
+
     total_loss = lm_loss + alpha * policy_loss
 
     return total_loss, avg_frac

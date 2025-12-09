@@ -29,7 +29,7 @@ bias = True
 # LTP-specific knobs (high-level)
 use_token_pruning = True
 pruning_temperature = 5.0    # temperature for soft pruning mask
-lambda_sparsity = 0.1        # sparsity regularization weight
+lambda_sparsity = 0.01        # sparsity regularization weight
 
 # how aggressively to protect the tail
 protected_tail_tokens = 128   # last 128 tokens never pruned
@@ -44,7 +44,7 @@ grad_clip = 1.0
 
 # LR decay
 decay_lr = True
-warmup_iters = 1000
+warmup_iters = 30
 lr_decay_iters = max_iters
 min_lr = 3e-5
 
@@ -81,4 +81,4 @@ final_token_threshold = 0.01
 min_keep_tokens = protected_tail_tokens
 
 freeze_base_weights = False
-
+resume_from_ltp = False

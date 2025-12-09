@@ -177,9 +177,11 @@ if resume_from_ltp and os.path.exists(os.path.join(out_dir, "ckpt.pt")):
     ckpt = torch.load(os.path.join(out_dir, "ckpt.pt"), map_location=device)
     model.load_state_dict(ckpt["model"], strict=False)
 else:
-    # Load from baseline checkpoint
-    ckpt = torch.load("experiment/models/baseline_ckpt.pt",
-                      map_location=device)
+    # Always load baseline from this fixed path
+    baseline_path = "out-ltp-wt2/baseline_ckpt.pt"
+    if master_process:
+        print(f"Loading baseline from {baseline_path}")
+    ckpt = torch.load(baseline_path, map_location=device)
     model.load_state_dict(ckpt["model"], strict=False)
 
 if compile and device_type == "cuda":

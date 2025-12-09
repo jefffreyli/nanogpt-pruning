@@ -205,28 +205,48 @@ if init_from == 'scratch':
     model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+
+    # --- choose which checkpoint file to load ---
+    if use_token_reduction and rl_stage:
+        # RL stage: prefer frozen baseline copy
+        baseline_path = os.path.join(out_dir, 'baseline_ckpt.pt')
+        if os.path.exists(baseline_path):
+            ckpt_path = baseline_path
+            if master_process:
+                print(f"Loading baseline weights from {ckpt_path}")
+        else:
+            ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+            if master_process:
+                print(f"'baseline_ckpt.pt' not found, falling back to {ckpt_path}")
+    else:
+        # normal resume (e.g. baseline training)
+        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+
+    # --- load checkpoint ---
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
+
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
+
     unwanted_prefix = '_orig_mod.'
     for k, v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if master_process:
         print("Missing keys when loading:", missing)
         print("Unexpected keys when loading:", unexpected)
 
+    # --- iteration / history handling ---
     if use_token_reduction and rl_stage:
         # RL phase: new run on top of baseline weights
         iter_num = 0
         best_val_loss = 1e9
-        # Reset training history for RL stage
         training_history = {
             'train_losses': [],
             'val_losses': [],
@@ -236,12 +256,13 @@ elif init_from == 'resume':
         # normal resume (e.g., baseline training)
         iter_num = checkpoint['iter_num']
         best_val_loss = checkpoint['best_val_loss']
-        # Load training history if available
         if 'training_history' in checkpoint:
             training_history = checkpoint['training_history']
             if master_process:
                 print(
-                    f"Loaded training history with {len(training_history['train_losses'])} training steps")
+                    f"Loaded training history with {len(training_history['train_losses'])} training steps"
+                )
+
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights

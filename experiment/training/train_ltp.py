@@ -101,21 +101,27 @@ else:
     master_process = True
 
 device_type = "cuda" if "cuda" in device else "cpu"
-ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(
+    device_type=device_type, dtype=torch.bfloat16)
 
 # ---------------------------------------------------------------------------
 # Data loading (NanoGPT-style .bin)
 # ---------------------------------------------------------------------------
 
 data_dir = os.path.join("data", dataset)
-train_data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
-val_data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
+train_data = np.memmap(os.path.join(
+    data_dir, "train.bin"), dtype=np.uint16, mode="r")
+val_data = np.memmap(os.path.join(data_dir, "val.bin"),
+                     dtype=np.uint16, mode="r")
+
 
 def get_batch(split: str):
     data = train_data if split == "train" else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy(data[i : i + block_size].astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy(data[i + 1 : i + 1 + block_size].astype(np.int64)) for i in ix])
+    x = torch.stack(
+        [torch.from_numpy(data[i: i + block_size].astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy(
+        data[i + 1: i + 1 + block_size].astype(np.int64)) for i in ix])
     if device_type == "cuda":
         x = x.pin_memory().to(device, non_blocking=True)
         y = y.pin_memory().to(device, non_blocking=True)
@@ -125,6 +131,7 @@ def get_batch(split: str):
     return x, y
 
 # meta.pkl for vocab size ----------------------------------------------------
+
 
 meta_vocab_size = None
 meta_path = os.path.join(data_dir, "meta.pkl")
@@ -162,8 +169,18 @@ if master_process:
 gptconf = GPTConfigLTP(**model_args)
 model = GPTLTP(gptconf)
 
-ckpt = torch.load("experiment/models/baseline_ckpt.pt", map_location=device)
-model.load_state_dict(ckpt["model"], strict=False)
+# Check if we should resume from previous LTP training
+resume_from_ltp = getattr(cfg, "resume_from_ltp", False)
+if resume_from_ltp and os.path.exists(os.path.join(out_dir, "ckpt.pt")):
+    if master_process:
+        print(f"Resuming LTP training from {out_dir}/ckpt.pt")
+    ckpt = torch.load(os.path.join(out_dir, "ckpt.pt"), map_location=device)
+    model.load_state_dict(ckpt["model"], strict=False)
+else:
+    # Load from baseline checkpoint
+    ckpt = torch.load("experiment/models/baseline_ckpt.pt",
+                      map_location=device)
+    model.load_state_dict(ckpt["model"], strict=False)
 
 if compile and device_type == "cuda":
     model = torch.compile(model)
@@ -174,7 +191,7 @@ model.to(device)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
-    
+
 # --- NEW: optionally freeze all base weights except pruning thresholds ---
 freeze_base = getattr(cfg, "freeze_base_weights", False)
 
@@ -203,11 +220,13 @@ if freeze_base:
 # optimizer ------------------------------------------------------------------
 
 raw_model = model.module if ddp else model
-optimizer = raw_model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = raw_model.configure_optimizers(
+    weight_decay, learning_rate, (beta1, beta2), device_type)
 
 # ---------------------------------------------------------------------------
 # Learning rate schedule
 # ---------------------------------------------------------------------------
+
 
 def get_lr(it):
     if not decay_lr:
@@ -223,6 +242,7 @@ def get_lr(it):
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
+
 
 @torch.no_grad()
 def estimate_loss():
@@ -244,12 +264,38 @@ def estimate_loss():
 # Training loop
 # ---------------------------------------------------------------------------
 
+
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 
 iter_num = 0
 best_val_loss = 1e9
-tokens_per_iter = gradient_accumulation_steps * batch_size * block_size * ddp_world_size
+tokens_per_iter = gradient_accumulation_steps * \
+    batch_size * block_size * ddp_world_size
+
+# Initialize training history for plotting
+training_history = {
+    'train_losses': [],      # list of (iter_num, loss)
+    'val_losses': [],        # list of (iter_num, loss)
+    'val_perplexities': [],  # list of (iter_num, perplexity)
+}
+
+# Load training state if resuming
+if resume_from_ltp and os.path.exists(os.path.join(out_dir, "ckpt.pt")):
+    ckpt_path = os.path.join(out_dir, "ckpt.pt")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    if 'iter_num' in checkpoint:
+        iter_num = checkpoint['iter_num']
+    if 'best_val_loss' in checkpoint:
+        best_val_loss = checkpoint['best_val_loss']
+    if 'training_history' in checkpoint:
+        training_history = checkpoint['training_history']
+        if master_process:
+            print(
+                f"Loaded training history with {len(training_history['train_losses'])} training steps")
+    if master_process:
+        print(
+            f"Resuming from iter {iter_num} with best_val_loss {best_val_loss:.4f}")
 
 raw_model = model.module if ddp else model
 raw_model.train()
@@ -261,9 +307,15 @@ while True:
 
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
+        val_perplexity = math.exp(losses['val'])
+
+        # Log validation metrics to history
+        training_history['val_losses'].append((iter_num, losses['val']))
+        training_history['val_perplexities'].append((iter_num, val_perplexity))
+
         print(
             f"step {iter_num}: train loss {losses['train']:.4f}, "
-            f"val loss {losses['val']:.4f}"
+            f"val loss {losses['val']:.4f}, val ppl {val_perplexity:.2f}"
         )
         # optional: print pruning stats on a small sample
         X, _ = get_batch("val")
@@ -289,6 +341,7 @@ while True:
                     "iter_num": iter_num,
                     "best_val_loss": best_val_loss,
                     "model_args": model_args,
+                    "training_history": training_history,
                 }
                 torch.save(checkpoint, ckpt_path)
                 print(f"saved checkpoint to {ckpt_path}")
@@ -298,17 +351,24 @@ while True:
 
     # gradient accumulation
     optimizer.zero_grad(set_to_none=True)
+    total_loss = 0.0
     for micro in range(gradient_accumulation_steps):
         X, Y = get_batch("train")
         with ctx:
             logits, loss = raw_model(X, Y)
             loss = loss / gradient_accumulation_steps
         loss.backward()
+        total_loss += loss.item()
 
     if grad_clip is not None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
     optimizer.step()
+
+    # Log training loss to history
+    if master_process:
+        training_history['train_losses'].append((iter_num, total_loss))
+
     iter_num += 1
 
 destroy_process_group() if ddp else None

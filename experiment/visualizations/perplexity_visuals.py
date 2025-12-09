@@ -10,7 +10,6 @@ It creates line graphs showing relationships across different configurations
 (e.g., sequence length, model size) to reveal deeper insights.
 """
 
-from model import GPT as BaselineGPT, GPTConfig as BaselineGPTConfig
 import os
 import sys
 import torch
@@ -21,8 +20,9 @@ from typing import Dict, List, Optional, Tuple
 # Add parent directories to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from experiment.models.dynamic_token_reduction_model import GPT as DynamicTRGPT, GPTConfig as DynamicTRGPTConfig
 from experiment.models.ltp_model import GPTLTP, GPTConfigLTP
+from experiment.models.dynamic_token_reduction_model import GPT as DynamicTRGPT, GPTConfig as DynamicTRGPTConfig
+from model import GPT as BaselineGPT, GPTConfig as BaselineGPTConfig
 
 
 def evaluate_perplexity(
@@ -576,6 +576,137 @@ def analyze_perplexity_vs_model_size(
         plt.close()
 
 
+def load_training_history(checkpoint_path: str) -> Optional[Dict]:
+    """
+    Load training history from a checkpoint file.
+
+    Args:
+        checkpoint_path: Path to the checkpoint file
+
+    Returns:
+        Dictionary containing training history or None if not found
+    """
+    if not os.path.exists(checkpoint_path):
+        print(f"Checkpoint not found: {checkpoint_path}")
+        return None
+
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        if 'training_history' in checkpoint:
+            history = checkpoint['training_history']
+            print(f"Loaded training history from {checkpoint_path}")
+            print(f"  - Training steps: {len(history['train_losses'])}")
+            print(f"  - Validation steps: {len(history['val_losses'])}")
+            return history
+        else:
+            print(f"No training history found in {checkpoint_path}")
+            return None
+    except Exception as e:
+        print(f"Error loading checkpoint {checkpoint_path}: {e}")
+        return None
+
+
+def plot_training_curves(
+    checkpoint_paths: Dict[str, str],
+    save_dir: Optional[str] = None,
+    show_plot: bool = False,
+) -> None:
+    """
+    Plot training curves (loss and perplexity) from checkpoint histories.
+
+    Args:
+        checkpoint_paths: Dictionary mapping model names to checkpoint paths
+        save_dir: Directory to save plots (optional)
+        show_plot: Whether to display the plots
+    """
+    histories = {}
+    model_labels = {
+        'baseline': 'Baseline GPT',
+        'ltp': 'LTP (Learned Token Pruning)',
+        'dynamic_tr': 'Dynamic Token Reduction'
+    }
+
+    # Load all histories
+    for model_name, ckpt_path in checkpoint_paths.items():
+        history = load_training_history(ckpt_path)
+        if history:
+            histories[model_name] = history
+
+    if not histories:
+        print("No training histories found. Skipping training curve plots.")
+        return
+
+    # Create figure with 3 subplots
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    colors = {
+        'baseline': '#2E86AB',
+        'ltp': '#A23B72',
+        'dynamic_tr': '#F18F01'
+    }
+
+    # Plot 1: Training Loss vs Steps
+    ax = axes[0]
+    for model_name, history in histories.items():
+        if history['train_losses']:
+            steps, losses = zip(*history['train_losses'])
+            label = model_labels.get(model_name, model_name)
+            color = colors.get(model_name, None)
+            ax.plot(steps, losses, label=label,
+                    linewidth=2, alpha=0.8, color=color)
+
+    ax.set_xlabel("Training Steps", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Training Loss", fontsize=12, fontweight="bold")
+    ax.set_title("Training Loss vs Steps", fontsize=14, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3, linestyle="--")
+
+    # Plot 2: Validation Loss vs Steps
+    ax = axes[1]
+    for model_name, history in histories.items():
+        if history['val_losses']:
+            steps, losses = zip(*history['val_losses'])
+            label = model_labels.get(model_name, model_name)
+            color = colors.get(model_name, None)
+            ax.plot(steps, losses, label=label, linewidth=2,
+                    alpha=0.8, color=color, marker='o', markersize=4)
+
+    ax.set_xlabel("Training Steps", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Validation Loss", fontsize=12, fontweight="bold")
+    ax.set_title("Validation Loss vs Steps", fontsize=14, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3, linestyle="--")
+
+    # Plot 3: Validation Perplexity vs Steps
+    ax = axes[2]
+    for model_name, history in histories.items():
+        if history['val_perplexities']:
+            steps, ppls = zip(*history['val_perplexities'])
+            label = model_labels.get(model_name, model_name)
+            color = colors.get(model_name, None)
+            ax.plot(steps, ppls, label=label, linewidth=2,
+                    alpha=0.8, color=color, marker='o', markersize=4)
+
+    ax.set_xlabel("Training Steps", fontsize=12, fontweight="bold")
+    ax.set_ylabel("Validation Perplexity", fontsize=12, fontweight="bold")
+    ax.set_title("Validation Perplexity vs Steps",
+                 fontsize=14, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3, linestyle="--")
+
+    plt.tight_layout()
+
+    if save_dir:
+        save_path = os.path.join(save_dir, "training_curves.png")
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"\nTraining curves saved to {save_path}")
+
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
+
+
 def create_perplexity_line_plot(
     results_list: List[Dict[str, Dict[str, float]]],
     labels: Optional[List[str]] = None,
@@ -675,8 +806,25 @@ def main():
     print("=" * 60)
 
     output_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))
+
+    # Training curves from checkpoints
+    print("\n--- Training Curves from Checkpoints ---")
+    checkpoint_paths = {
+        'baseline': os.path.join(project_root, "out-baseline-wt2", "baseline_ckpt.pt"),
+        'ltp': os.path.join(project_root, "out-ltp-wt2", "ckpt.pt"),
+        'dynamic_tr': os.path.join(project_root, "out-dynamic-tr", "ckpt.pt"),
+    }
+
+    plot_training_curves(
+        checkpoint_paths=checkpoint_paths,
+        save_dir=output_dir,
+        show_plot=False
+    )
 
     # Perplexity vs sequence length
+    print("\n--- Perplexity vs Sequence Length ---")
     seq_len_path = os.path.join(
         output_dir, "perplexity_vs_sequence_length.png")
     analyze_perplexity_vs_sequence_length(
@@ -684,6 +832,7 @@ def main():
     )
 
     # Perplexity vs model size
+    print("\n--- Perplexity vs Model Size ---")
     model_size_path = os.path.join(output_dir, "perplexity_vs_model_size.png")
     analyze_perplexity_vs_model_size(
         num_batches=5, device=device, save_path=model_size_path, show_plot=False

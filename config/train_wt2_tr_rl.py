@@ -22,7 +22,7 @@ n_embd = 768
 dropout = 0.0
 bias = True
 
-max_iters = 500          # fewer steps for RL fine-tuning
+max_iters = 300          # fewer steps for RL fine-tuning
 learning_rate = 1e-4     # smaller LR for policy + slight LM tuning
 warmup_iters = 50
 lr_decay_iters = max_iters

@@ -36,7 +36,7 @@ protected_tail_tokens = 128   # last 128 tokens never pruned
 
 # training schedule
 learning_rate = 3e-4
-max_iters = 10000
+max_iters = 300
 weight_decay = 0.01
 beta1 = 0.9
 beta2 = 0.95

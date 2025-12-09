@@ -27,7 +27,7 @@ dropout = 0.0
 bias = True
 
 # train length / lr
-max_iters = 1000
+max_iters = 300
 learning_rate = 3e-4
 
 # I'd shorten warmup; 1000 steps of warmup on a 1000-step run is overkill.

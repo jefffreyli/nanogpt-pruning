@@ -299,12 +299,14 @@ class TokenPolicy(nn.Module):
         )
 
     def forward(self, h):
-        # Run in float32 to avoid mixed-precision numerical issues
-        h_float = h.float()
-        logits = self.net(h_float)
-        probs = torch.sigmoid(logits)
-        # Clamp to valid probability range for torch.bernoulli
-        probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)
+        # Disable autocast and run in float32 to avoid mixed-precision numerical issues
+        # This is critical for RL training where bernoulli sampling requires valid [0,1] probs
+        with torch.amp.autocast(device_type='cuda', enabled=False):
+            h_float = h.float()
+            logits = self.net(h_float)
+            probs = torch.sigmoid(logits)
+            # Clamp to valid probability range for torch.bernoulli
+            probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)
         return probs.squeeze(-1)
 
 

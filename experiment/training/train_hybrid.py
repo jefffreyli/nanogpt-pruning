@@ -14,6 +14,7 @@ Usage:
     python experiment/training/train_hybrid.py config/train_hybrid_wt2.py
 """
 
+from experiment.models.hybrid_model import GPTConfigHybrid, GPTHybrid
 import os
 import sys
 import time
@@ -28,7 +29,6 @@ from torch.distributed import init_process_group, destroy_process_group
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from experiment.models.hybrid_model import GPTConfigHybrid, GPTHybrid
 
 # -----------------------------------------------------------------------------
 # Default config values
@@ -77,6 +77,8 @@ min_keep_tokens = 64
 
 # Stage control
 rl_stage = False  # False = Stage 1 (LTP), True = Stage 2 (RL)
+# True = freeze everything except LTP layers (for hybrid RL+LTP)
+ltp_training_only = False
 
 # optimizer
 learning_rate = 3e-4
@@ -295,11 +297,12 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # -----------------------------------------------------------------------------
-# Freeze parameters for Stage 2 (RL training)
+# Freeze parameters for different training stages
 # -----------------------------------------------------------------------------
 raw_model = model
 
 if rl_stage:
+    # Stage 2 (RL): Freeze GPT2 backbone and LTP thresholds, train only RL policies
     if master_process:
         print("RL stage: freezing GPT2 backbone and LTP thresholds, training only policies")
 
@@ -316,6 +319,39 @@ if rl_stage:
 
     if master_process:
         print(f"Trainable parameters ({len(trainable_params)}):")
+        for n in trainable_params:
+            print(f"  {n}")
+        print(f"Frozen parameters count: {len(frozen_params)}")
+
+elif ltp_training_only:
+    # LTP-only training: Freeze GPT2 backbone and RL policies, train only LTP layers
+    if master_process:
+        print("LTP-only training: freezing GPT2 backbone and RL policies, training only LTP layers")
+
+    trainable_params = []
+    frozen_params = []
+
+    for name, param in raw_model.named_parameters():
+        # Only train LTP-specific parameters in the specified LTP layers
+        is_ltp_param = False
+        for ltp_layer_idx in ltp_layers:
+            if f"transformer.h.{ltp_layer_idx}." in name:
+                # Train threshold and optionally attention parameters in LTP layers
+                if "threshold" in name:
+                    is_ltp_param = True
+                # Uncomment the following lines to also train attention parameters in LTP layers:
+                # elif "attn" in name or "ln_1" in name:
+                #     is_ltp_param = True
+
+        if is_ltp_param:
+            param.requires_grad = True
+            trainable_params.append(name)
+        else:
+            param.requires_grad = False
+            frozen_params.append(name)
+
+    if master_process:
+        print(f"Trainable LTP parameters ({len(trainable_params)}):")
         for n in trainable_params:
             print(f"  {n}")
         print(f"Frozen parameters count: {len(frozen_params)}")

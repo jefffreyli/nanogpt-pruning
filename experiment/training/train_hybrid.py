@@ -352,10 +352,20 @@ raw_model = model.module if ddp else model
 # -----------------------------------------------------------------------------
 # Loss computation with RL
 # -----------------------------------------------------------------------------
-def compute_total_loss(lm_loss, rl_info, seq_len, raw_model):
+def compute_total_loss(lm_loss, rl_info, seq_len, raw_model, rl_stage=False):
     """
     Combine LM loss with RL policy gradient loss.
-    Added numerical stability: clamp log probs, check for NaN.
+
+    IMPORTANT: In Stage 2 (rl_stage=True), only policy parameters are trainable.
+    The returned loss MUST have a gradient path to the policy parameters.
+    We use REINFORCE: policy_loss = -reward * log_prob(actions)
+
+    Args:
+        lm_loss: Language model cross-entropy loss
+        rl_info: Dict with policy_logprobs and num_selected_tokens
+        seq_len: Sequence length T
+        raw_model: Model to get config from
+        rl_stage: If True, we're in Stage 2 with frozen GPT2
     """
     policy_logprobs = rl_info["policy_logprobs"]
     num_selected_tokens = rl_info["num_selected_tokens"]
@@ -370,7 +380,7 @@ def compute_total_loss(lm_loss, rl_info, seq_len, raw_model):
     T = seq_len
 
     # Clamp log probs to prevent extreme values
-    logp = torch.clamp(logp, min=-100.0, max=0.0)
+    logp = torch.clamp(logp, min=-20.0, max=0.0)
 
     logp_total = logp.sum(dim=0) / (L * T)
     frac_selected = selected.sum(dim=0) / (L * T)
@@ -387,15 +397,25 @@ def compute_total_loss(lm_loss, rl_info, seq_len, raw_model):
         # Normalize reward for stability
         reward_std = reward.std() + 1e-8
         reward = reward / reward_std
+        # Clamp reward to prevent extreme policy gradients
+        reward = torch.clamp(reward, -3.0, 3.0)
 
     policy_loss = -(reward * logp_total).mean()
 
-    # Check for NaN and skip RL loss if detected
+    # Check for NaN/Inf
     if torch.isnan(policy_loss) or torch.isinf(policy_loss):
-        print("Warning: NaN/Inf detected in policy_loss, using only LM loss")
-        return lm_loss, avg_frac
+        print("Warning: NaN/Inf detected in policy_loss, using zero policy loss")
+        # Use a zero loss that still has gradient to policy params
+        policy_loss = 0.0 * logp_total.mean()
 
-    total_loss = lm_loss + alpha * policy_loss
+    if rl_stage:
+        # Stage 2: Only policy params are trainable
+        # lm_loss has NO gradient path to policy params (GPT2 is frozen, bernoulli breaks grad)
+        # So we use ONLY policy_loss for backward, but include lm_loss.detach() for logging
+        total_loss = lm_loss.detach() + alpha * policy_loss
+    else:
+        # Stage 1: All params trainable, include both losses
+        total_loss = lm_loss + alpha * policy_loss
 
     return total_loss, avg_frac
 
@@ -526,13 +546,14 @@ while True:
         with ctx:
             if rl_stage:
                 # Stage 2: use Dynamic TR with RL training
+                # Only policy params are trainable, GPT2+LTP are frozen
                 logits, lm_loss, rl_info = raw_model(
                     X, Y,
                     use_token_reduction=True,
                     policy_training=True,
                 )
                 total_loss, avg_frac_step = compute_total_loss(
-                    lm_loss, rl_info, X.size(1), raw_model)
+                    lm_loss, rl_info, X.size(1), raw_model, rl_stage=True)
                 avg_frac = avg_frac_step
                 loss = total_loss / gradient_accumulation_steps
             else:

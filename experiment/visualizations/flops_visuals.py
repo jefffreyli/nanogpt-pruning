@@ -1,13 +1,7 @@
 """
 FLOPs Visualization Script
 
-This script analyzes and visualizes FLOPs (Floating Point Operations) metrics between:
-1. Baseline GPT model
-2. LTP (Learned Token Pruning) model
-3. Dynamic Token Reduction model
-
-It creates line graphs showing relationships across different configurations
-(e.g., sequence length, model size) to reveal scaling behavior and efficiency.
+python experiment/visualizations/flops_visuals.py
 """
 
 import os
@@ -17,8 +11,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, List, Optional, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from experiment.models.hybrid_model import GPTHybrid, GPTConfigHybrid
 from experiment.models.ltp_model import GPTLTP, GPTConfigLTP
 from experiment.models.dynamic_token_reduction_model import GPT as DynamicTRGPT, GPTConfig as DynamicTRGPTConfig
 from model import GPT as BaselineGPT, GPTConfig as BaselineGPTConfig
@@ -242,6 +238,70 @@ def evaluate_dynamic_tr_model_flops(
         "macs_g": macs / 1e9,  # Giga MACs
         "params_m": params / 1e6,  # Million parameters
         "model_name": "Dynamic Token Reduction",
+    }
+
+
+def evaluate_hybrid_model_flops(
+    config: Optional[GPTConfigHybrid] = None,
+    checkpoint_path: Optional[str] = None,
+    batch_size: int = 1,
+    device: str = "cpu",
+) -> Dict[str, float]:
+    """
+    Evaluate Hybrid model FLOPs.
+
+    Args:
+        config: Model configuration (uses default if None)
+        checkpoint_path: Path to model checkpoint (optional)
+        batch_size: Batch size for evaluation
+        device: Device to run evaluation on
+
+    Returns:
+        Dictionary with FLOPs and parameter metrics
+    """
+    if config is None:
+        config = GPTConfigHybrid(
+            block_size=256,
+            vocab_size=50304,
+            n_layer=6,
+            n_head=6,
+            n_embd=384,
+            dropout=0.0,
+            bias=True,
+            reduction_layers=(2,),
+            policy_hidden_dim=256,
+            lambda_tokens=1e-4,
+            rl_weight=0.1,
+            ltp_layers=(3, 4, 5),
+            final_token_threshold=0.01,
+            temperature=5.0,
+            masking_mode="soft",
+            lambda_factor=0.1,
+            min_keep_tokens=64,
+        )
+
+    model = GPTHybrid(config)
+
+    # Load checkpoint if provided
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        print(f"Loaded checkpoint from {checkpoint_path}")
+
+    macs, params = evaluate_flops(
+        model,
+        batch_size=batch_size,
+        block_size=config.block_size,
+        vocab_size=config.vocab_size,
+        device=device,
+    )
+
+    return {
+        "macs": macs,
+        "params": params,
+        "macs_g": macs / 1e9,  # Giga MACs
+        "params_m": params / 1e6,  # Million parameters
+        "model_name": "Hybrid (Dynamic TR + LTP)",
     }
 
 
@@ -506,21 +566,133 @@ def compute_effective_flops_dynamic_tr(
     }
 
 
+def compute_effective_flops_hybrid(
+    config: GPTConfigHybrid,
+    batch_size: int = 1,
+    device: str = "cpu",
+    checkpoint_path: Optional[str] = None,
+) -> Dict[str, float]:
+    """
+    Compute effective FLOPs for Hybrid model accounting for both token reduction and pruning.
+
+    Uses model.get_pruning_stats() to get actual keep ratios per layer,
+    then calculates FLOPs scaled by the fraction of active tokens.
+
+    Args:
+        config: Hybrid model configuration
+        batch_size: Batch size for evaluation
+        device: Device to run evaluation on
+        checkpoint_path: Optional path to model checkpoint
+
+    Returns:
+        Dictionary with effective FLOPs metrics
+    """
+    model = GPTHybrid(config)
+    model.eval()
+    model.to(device)
+
+    # Load checkpoint if provided
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"  Loading Hybrid checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+
+        # If checkpoint has model_args, we could use them to verify config matches
+        if "model_args" in checkpoint:
+            print(f"  Checkpoint was trained with: {checkpoint['model_args']}")
+
+    # Create dummy input and get pruning statistics
+    dummy_input = torch.randint(
+        0, config.vocab_size, (batch_size, config.block_size), device=device
+    )
+
+    with torch.no_grad():
+        stats = model.get_pruning_stats(dummy_input)
+
+    T = config.block_size
+    d = config.n_embd
+
+    # Embedding - THOP typically doesn't count this as MACs
+    embedding_flops = 0
+    total_effective_flops = embedding_flops
+
+    for layer_idx in range(config.n_layer):
+        # Get keep ratio for this layer from stats
+        if stats and layer_idx < len(stats):
+            keep_ratio = stats[layer_idx]["keep_ratio"]
+        else:
+            keep_ratio = 1.0
+
+        # Effective sequence length after pruning
+        T_eff = T * keep_ratio
+
+        # LayerNorm 1 (before attention)
+        ln1_flops = 2 * T_eff * d
+
+        # Attention
+        attn_qkv = 3 * T_eff * d * d
+        attn_scores = 2 * T_eff * T_eff * d
+        attn_proj = T_eff * d * d
+
+        # LayerNorm 2 (before MLP)
+        ln2_flops = 2 * T_eff * d
+
+        # MLP: fc1 (T_eff * d * 4d) + fc2 (T_eff * 4d * d)
+        mlp = T_eff * d * 4 * d + T_eff * 4 * d * d  # = 8 * T_eff * d^2
+
+        layer_flops = ln1_flops + attn_qkv + attn_scores + attn_proj + ln2_flops + mlp
+
+        # Add policy network FLOPs if this is a reduction layer
+        if layer_idx in config.reduction_layers:
+            policy_hidden = config.policy_hidden_dim
+            # Policy: Linear1 (T_eff * d * hidden) + Linear2 (T_eff * hidden * 1)
+            policy_flops = T_eff * d * policy_hidden + T_eff * policy_hidden * 1
+            layer_flops += policy_flops
+
+        total_effective_flops += layer_flops
+
+    # Final layer norm and LM head (use final keep ratio)
+    final_keep_ratio = stats[-1]["keep_ratio"] if stats else 1.0
+    final_T = T * final_keep_ratio
+    final_ln = 2 * final_T * d
+    lm_head = final_T * d * config.vocab_size
+    total_effective_flops += final_ln + lm_head
+
+    # Get parameter count
+    params = sum(p.numel() for p in model.parameters())
+
+    # Calculate average keep ratio for reporting
+    avg_keep_ratio = np.mean([s["keep_ratio"]
+                             for s in stats]) if stats else 1.0
+
+    return {
+        "macs": int(total_effective_flops),
+        "params": params,
+        "macs_g": total_effective_flops / 1e9,
+        "params_m": params / 1e6,
+        "model_name": "Hybrid (Dynamic TR + LTP)",
+        "avg_keep_ratio": avg_keep_ratio,
+        "layer_stats": stats,
+    }
+
+
 def compare_models_flops(
     baseline_config: Optional[BaselineGPTConfig] = None,
     ltp_config: Optional[GPTConfigLTP] = None,
     dynamic_tr_config: Optional[DynamicTRGPTConfig] = None,
+    hybrid_config: Optional[GPTConfigHybrid] = None,
     baseline_checkpoint: Optional[str] = None,
     ltp_checkpoint: Optional[str] = None,
     dynamic_tr_checkpoint: Optional[str] = None,
+    hybrid_checkpoint: Optional[str] = None,
     batch_size: int = 1,
     device: str = "cpu",
 ) -> Dict[str, Dict[str, float]]:
     """
-    Compare FLOPs between Baseline, LTP, and Dynamic Token Reduction models.
+    Compare FLOPs between Baseline, LTP, Dynamic Token Reduction, and Hybrid models.
 
     Returns:
-        Dictionary with results for all three models
+        Dictionary with results for all four models
     """
     print("Evaluating Baseline GPT model FLOPs...")
     baseline_results = evaluate_baseline_model_flops(
@@ -546,10 +718,19 @@ def compare_models_flops(
         device=device,
     )
 
+    print("\nEvaluating Hybrid model FLOPs...")
+    hybrid_results = evaluate_hybrid_model_flops(
+        config=hybrid_config,
+        checkpoint_path=hybrid_checkpoint,
+        batch_size=batch_size,
+        device=device,
+    )
+
     return {
         "baseline": baseline_results,
         "ltp": ltp_results,
         "dynamic_tr": dynamic_tr_results,
+        "hybrid": hybrid_results,
     }
 
 
@@ -561,6 +742,7 @@ def analyze_flops_vs_sequence_length(
     baseline_checkpoint: Optional[str] = None,
     ltp_checkpoint: Optional[str] = None,
     dynamic_tr_checkpoint: Optional[str] = None,
+    hybrid_checkpoint: Optional[str] = None,
 ) -> None:
     """
     Create line graphs showing how FLOPs scale with sequence length.
@@ -574,6 +756,7 @@ def analyze_flops_vs_sequence_length(
         baseline_checkpoint: Path to trained baseline model checkpoint (optional)
         ltp_checkpoint: Path to trained LTP model checkpoint (optional)
         dynamic_tr_checkpoint: Path to trained Dynamic TR model checkpoint (optional)
+        hybrid_checkpoint: Path to trained Hybrid model checkpoint (optional)
     """
     if sequence_lengths is None:
         sequence_lengths = [64, 128, 256, 512, 1024]
@@ -581,6 +764,7 @@ def analyze_flops_vs_sequence_length(
     baseline_flops = []
     ltp_flops = []
     dynamic_tr_flops = []
+    hybrid_flops = []
 
     print("Analyzing FLOPs vs sequence length...")
     for seq_len in sequence_lengths:
@@ -649,6 +833,33 @@ def analyze_flops_vs_sequence_length(
         )
         dynamic_tr_flops.append(dynamic_tr_result["macs_g"])
 
+        # Hybrid - use effective FLOPs that account for both token reduction and pruning (GPT-2 architecture)
+        hybrid_config = GPTConfigHybrid(
+            block_size=seq_len,
+            vocab_size=50257,  # GPT-2 vocab size
+            n_layer=12,
+            n_head=12,
+            n_embd=768,
+            dropout=0.0,
+            bias=True,
+            reduction_layers=(4, 8),  # Layers 4 and 8 for 12-layer model
+            policy_hidden_dim=256,
+            lambda_tokens=1e-4,
+            rl_weight=0.1,
+            ltp_layers=(9, 10, 11),  # Layers 9, 10, 11 for LTP
+            final_token_threshold=0.01,
+            temperature=5.0,
+            masking_mode="soft",
+            lambda_factor=0.1,
+            min_keep_tokens=min(128, seq_len // 4),
+        )
+        # Only load checkpoint if sequence length matches checkpoint's block_size (512)
+        hybrid_ckpt = hybrid_checkpoint if seq_len == 512 else None
+        hybrid_result = compute_effective_flops_hybrid(
+            config=hybrid_config, device=device, checkpoint_path=hybrid_ckpt
+        )
+        hybrid_flops.append(hybrid_result["macs_g"])
+
     # Create line plot
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -658,7 +869,7 @@ def analyze_flops_vs_sequence_length(
         marker="o",
         linewidth=2,
         markersize=8,
-        label="Baseline GPT",
+        label="Baseline",
         color="#1f77b4",
     )
     ax.plot(
@@ -667,7 +878,7 @@ def analyze_flops_vs_sequence_length(
         marker="s",
         linewidth=2,
         markersize=8,
-        label="LTP (Learned Token Pruning)",
+        label="LTP",
         color="#2E86AB",
     )
     ax.plot(
@@ -676,8 +887,17 @@ def analyze_flops_vs_sequence_length(
         marker="^",
         linewidth=2,
         markersize=8,
-        label="Dynamic Token Reduction",
+        label="Dynamic TR",
         color="#A23B72",
+    )
+    ax.plot(
+        sequence_lengths,
+        hybrid_flops,
+        marker="D",
+        linewidth=2,
+        markersize=8,
+        label="Hybrid",
+        color="#F18F01",
     )
 
     ax.set_xlabel("Sequence Length", fontsize=12, fontweight="bold")
@@ -709,6 +929,7 @@ def analyze_flops_vs_model_size(
     baseline_checkpoint: Optional[str] = None,
     ltp_checkpoint: Optional[str] = None,
     dynamic_tr_checkpoint: Optional[str] = None,
+    hybrid_checkpoint: Optional[str] = None,
 ) -> None:
     """
     Create line graphs showing how FLOPs change with model size (number of layers).
@@ -721,6 +942,7 @@ def analyze_flops_vs_model_size(
         baseline_checkpoint: Path to trained baseline model checkpoint (optional)
         ltp_checkpoint: Path to trained LTP model checkpoint (optional)
         dynamic_tr_checkpoint: Path to trained Dynamic TR model checkpoint (optional)
+        hybrid_checkpoint: Path to trained Hybrid model checkpoint (optional)
     """
     if n_layers_list is None:
         n_layers_list = [4, 6, 8, 10, 12]
@@ -728,6 +950,7 @@ def analyze_flops_vs_model_size(
     baseline_flops = []
     ltp_flops = []
     dynamic_tr_flops = []
+    hybrid_flops = []
 
     print("Analyzing FLOPs vs model size (number of layers)...")
     for n_layer in n_layers_list:
@@ -802,6 +1025,34 @@ def analyze_flops_vs_model_size(
         )
         dynamic_tr_flops.append(dynamic_tr_result["macs_g"])
 
+        # Hybrid - use effective FLOPs that account for both token reduction and pruning (GPT-2 architecture)
+        ltp_layers = tuple(range(max(0, n_layer - 3), n_layer))
+        hybrid_config = GPTConfigHybrid(
+            block_size=512,  # Match checkpoint block size
+            vocab_size=50257,  # GPT-2 vocab size
+            n_layer=n_layer,
+            n_head=12,
+            n_embd=768,
+            dropout=0.0,
+            bias=True,
+            reduction_layers=reduction_layers,
+            policy_hidden_dim=256,
+            lambda_tokens=1e-4,
+            rl_weight=0.1,
+            ltp_layers=ltp_layers,
+            final_token_threshold=0.01,
+            temperature=5.0,
+            masking_mode="soft",
+            lambda_factor=0.1,
+            min_keep_tokens=128,
+        )
+        # Only load checkpoint if n_layer matches checkpoint's n_layer (12)
+        hybrid_ckpt = hybrid_checkpoint if n_layer == 12 else None
+        hybrid_result = compute_effective_flops_hybrid(
+            config=hybrid_config, device=device, checkpoint_path=hybrid_ckpt
+        )
+        hybrid_flops.append(hybrid_result["macs_g"])
+
     # Create line plot
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -811,7 +1062,7 @@ def analyze_flops_vs_model_size(
         marker="o",
         linewidth=2,
         markersize=8,
-        label="Baseline GPT",
+        label="Baseline",
         color="#1f77b4",
     )
     ax.plot(
@@ -820,7 +1071,7 @@ def analyze_flops_vs_model_size(
         marker="s",
         linewidth=2,
         markersize=8,
-        label="LTP (Learned Token Pruning)",
+        label="LTP",
         color="#2E86AB",
     )
     ax.plot(
@@ -829,8 +1080,17 @@ def analyze_flops_vs_model_size(
         marker="^",
         linewidth=2,
         markersize=8,
-        label="Dynamic Token Reduction",
+        label="Dynamic TR",
         color="#A23B72",
+    )
+    ax.plot(
+        n_layers_list,
+        hybrid_flops,
+        marker="D",
+        linewidth=2,
+        markersize=8,
+        label="Hybrid",
+        color="#F18F01",
     )
 
     ax.set_xlabel("Number of Layers", fontsize=12, fontweight="bold")
@@ -840,7 +1100,8 @@ def analyze_flops_vs_model_size(
                  fontsize=14, fontweight="bold")
     ax.legend(fontsize=11)
     ax.grid(alpha=0.3, linestyle="--")
-    ax.set_yscale("log")
+    # ax.set_yscale("log")  # Removed log scale to allow y-axis to start at 0
+    ax.set_ylim(bottom=0)  # Start y-axis at 0
 
     plt.tight_layout()
 
@@ -957,7 +1218,7 @@ def create_flops_line_plot(
         marker="o",
         linewidth=2,
         markersize=8,
-        label="LTP (Learned Token Pruning)",
+        label="LTP",
         color="#2E86AB",
     )
     ax.plot(
@@ -966,7 +1227,7 @@ def create_flops_line_plot(
         marker="s",
         linewidth=2,
         markersize=8,
-        label="Dynamic Token Reduction",
+        label="Dynamic TR",
         color="#A23B72",
     )
 
@@ -1007,7 +1268,7 @@ def main():
 
     # Compare models with default configurations (GPT-2 architecture)
     print("=" * 60)
-    print("FLOPs ANALYSIS: Baseline vs LTP vs Dynamic Token Reduction")
+    print("FLOPs ANALYSIS: Baseline vs LTP vs Dynamic TR vs Hybrid")
     print("=" * 60)
 
     # Use GPT-2 architecture for fair comparison
@@ -1052,10 +1313,31 @@ def main():
         rl_weight=0.1,
     )
 
+    hybrid_config = GPTConfigHybrid(
+        block_size=512,
+        vocab_size=50257,
+        n_layer=12,
+        n_head=12,
+        n_embd=768,
+        dropout=0.0,
+        bias=True,
+        reduction_layers=(4, 8),
+        policy_hidden_dim=256,
+        lambda_tokens=1e-4,
+        rl_weight=0.1,
+        ltp_layers=(9, 10, 11),
+        final_token_threshold=0.01,
+        temperature=5.0,
+        masking_mode="soft",
+        lambda_factor=0.1,
+        min_keep_tokens=128,
+    )
+
     results = compare_models_flops(
         baseline_config=baseline_config,
         ltp_config=ltp_config,
         dynamic_tr_config=dynamic_tr_config,
+        hybrid_config=hybrid_config,
         batch_size=1,
         device=device
     )
@@ -1096,11 +1378,10 @@ def main():
     project_root = os.path.dirname(os.path.dirname(
         os.path.dirname(os.path.abspath(__file__))))
     # Training saves to out-ltp-wt2/ckpt.pt by default (see train_ltp_wt2.py config)
-    baseline_checkpoint = os.path.join(
-        project_root, "out-baseline-wt2", "baseline_ckpt.pt")
-    ltp_checkpoint = os.path.join(project_root, "out-ltp-wt2", "ltp.pt")
-    dynamic_tr_checkpoint = os.path.join(
-        project_root, "out-dynamic-tr", "ckpt.pt")
+    baseline_checkpoint = os.path.join(project_root, "out-baseline-wt2", "baseline.pt")
+    ltp_checkpoint = os.path.join(project_root, "out-ltp-wt2", "ltp_ckpt.pt")
+    dynamic_tr_checkpoint = os.path.join(project_root, "out-dynamic-tr-wt2", "rl_ckpt.pt")
+    hybrid_checkpoint = os.path.join(project_root, "out-hybrid-wt2", "hybrid_ckpt.pt")
 
     # Check if checkpoints exist
     if os.path.exists(baseline_checkpoint):
@@ -1131,6 +1412,14 @@ def main():
         print("Using randomly initialized model for Dynamic TR analysis...")
         dynamic_tr_checkpoint = None
 
+    if os.path.exists(hybrid_checkpoint):
+        print(f"\nFound trained Hybrid checkpoint: {hybrid_checkpoint}")
+        print("Using trained model for Hybrid analysis...")
+    else:
+        print(f"\nNo trained Hybrid checkpoint found at {hybrid_checkpoint}")
+        print("Using randomly initialized model for Hybrid analysis...")
+        hybrid_checkpoint = None
+
     # FLOPs vs sequence length
     seq_len_path = os.path.join(output_dir, "flops_vs_sequence_length.png")
     analyze_flops_vs_sequence_length(
@@ -1140,6 +1429,7 @@ def main():
         baseline_checkpoint=baseline_checkpoint,
         ltp_checkpoint=ltp_checkpoint,
         dynamic_tr_checkpoint=dynamic_tr_checkpoint,
+        hybrid_checkpoint=hybrid_checkpoint,
     )
 
     # FLOPs vs model size
@@ -1151,6 +1441,7 @@ def main():
         baseline_checkpoint=baseline_checkpoint,
         ltp_checkpoint=ltp_checkpoint,
         dynamic_tr_checkpoint=dynamic_tr_checkpoint,
+        hybrid_checkpoint=hybrid_checkpoint,
     )
 
     print("\nAnalysis complete!")

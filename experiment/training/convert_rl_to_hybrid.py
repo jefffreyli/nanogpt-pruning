@@ -21,8 +21,8 @@ import torch
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-from experiment.models.hybrid_model import GPTHybrid, GPTConfigHybrid
 from experiment.models.dynamic_token_reduction_model import GPT, GPTConfig
+from experiment.models.hybrid_model import GPTHybrid, GPTConfigHybrid
 
 
 def convert_rl_to_hybrid(
@@ -203,7 +203,12 @@ def convert_rl_to_hybrid(
             'transferred_keys': len(transferred_keys),
             'missing_keys': len(missing_keys),
             'ltp_layers': ltp_layers,
-        }
+        },
+        'training_history': {
+            'train_losses': [],
+            'val_losses': [],
+            'val_perplexities': [],
+        }  # Initialize empty training history for compatibility
     }
 
     torch.save(converted_checkpoint, output_path)

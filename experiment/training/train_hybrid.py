@@ -14,7 +14,6 @@ Usage:
     python experiment/training/train_hybrid.py config/train_hybrid_wt2.py
 """
 
-from experiment.models.hybrid_model import GPTConfigHybrid, GPTHybrid
 import os
 import sys
 import time
@@ -29,6 +28,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+from experiment.models.hybrid_model import GPTConfigHybrid, GPTHybrid
 
 # -----------------------------------------------------------------------------
 # Default config values

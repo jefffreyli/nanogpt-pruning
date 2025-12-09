@@ -5,6 +5,7 @@ This script analyzes and visualizes perplexity metrics between:
 1. Baseline GPT model
 2. LTP (Learned Token Pruning) model
 3. Dynamic Token Reduction model
+4. Hybrid model (combining Dynamic TR and LTP)
 
 python experiment/visualizations/perplexity_visuals.py
 """
@@ -22,7 +23,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from experiment.models.ltp_model import GPTLTP, GPTConfigLTP
 from experiment.models.dynamic_token_reduction_model import GPT as DynamicTRGPT, GPTConfig as DynamicTRGPTConfig
+from experiment.models.hybrid_model import GPTHybrid, GPTConfigHybrid
 from model import GPT as BaselineGPT, GPTConfig as BaselineGPTConfig
+
 
 def load_wikitext2_data(data_dir: str = "data/wikitext2"):
     """
@@ -289,27 +292,88 @@ def evaluate_dynamic_tr_model(
     }
 
 
+def evaluate_hybrid_model(
+    checkpoint_path: str,
+    val_data: np.ndarray,
+    num_batches: int = 50,
+    device: str = "cpu",
+) -> Dict[str, float]:
+    """
+    Evaluate Hybrid model perplexity on WikiText-2 validation data.
+
+    Args:
+        checkpoint_path: Path to model checkpoint
+        val_data: WikiText-2 validation data
+        num_batches: Number of batches for evaluation
+        device: Device to run evaluation on
+
+    Returns:
+        Dictionary with loss and perplexity metrics
+    """
+    if not os.path.exists(checkpoint_path):
+        print(f"Warning: Checkpoint not found at {checkpoint_path}")
+        return {
+            "loss": float('nan'),
+            "perplexity": float('nan'),
+            "model_name": "Hybrid (Dynamic TR + LTP)",
+        }
+
+    # Load checkpoint to get config
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model_args = checkpoint.get('model_args', {})
+
+    # Filter to only include Hybrid parameters
+    hybrid_keys = {'n_layer', 'n_head', 'n_embd', 'block_size', 'bias',
+                   'vocab_size', 'dropout', 'reduction_layers', 'policy_hidden_dim',
+                   'lambda_tokens', 'rl_weight', 'ltp_layers', 'final_token_threshold',
+                   'temperature', 'masking_mode', 'lambda_factor', 'min_keep_tokens'}
+    filtered_args = {k: v for k, v in model_args.items() if k in hybrid_keys}
+
+    # Create config from checkpoint
+    config = GPTConfigHybrid(**filtered_args)
+    model = GPTHybrid(config)
+    model.load_state_dict(checkpoint["model"])
+    print(f"Loaded Hybrid checkpoint from {checkpoint_path}")
+
+    loss, perplexity = evaluate_perplexity(
+        model,
+        val_data,
+        num_batches=num_batches,
+        batch_size=8,
+        block_size=config.block_size,
+        device=device,
+    )
+
+    return {
+        "loss": loss,
+        "perplexity": perplexity,
+        "model_name": "Hybrid (Dynamic TR + LTP)",
+    }
+
+
 def compare_models(
     baseline_checkpoint: str,
     ltp_checkpoint: str,
     dynamic_tr_checkpoint: str,
+    hybrid_checkpoint: str,
     val_data: np.ndarray,
     num_batches: int = 50,
     device: str = "cpu",
 ) -> Dict[str, Dict[str, float]]:
     """
-    Compare perplexity between Baseline, LTP, and Dynamic Token Reduction models on WikiText-2.
+    Compare perplexity between Baseline, LTP, Dynamic Token Reduction, and Hybrid models on WikiText-2.
 
     Args:
         baseline_checkpoint: Path to baseline model checkpoint
         ltp_checkpoint: Path to LTP model checkpoint
         dynamic_tr_checkpoint: Path to Dynamic TR model checkpoint
+        hybrid_checkpoint: Path to Hybrid model checkpoint
         val_data: WikiText-2 validation data
         num_batches: Number of batches to evaluate
         device: Device to run on
 
     Returns:
-        Dictionary with results for all three models
+        Dictionary with results for all four models
     """
     print("Evaluating Baseline GPT model...")
     baseline_results = evaluate_baseline_model(
@@ -335,10 +399,19 @@ def compare_models(
         device=device,
     )
 
+    print("\nEvaluating Hybrid model...")
+    hybrid_results = evaluate_hybrid_model(
+        checkpoint_path=hybrid_checkpoint,
+        val_data=val_data,
+        num_batches=num_batches,
+        device=device,
+    )
+
     return {
         "baseline": baseline_results,
         "ltp": ltp_results,
         "dynamic_tr": dynamic_tr_results,
+        "hybrid": hybrid_results,
     }
 
 
@@ -346,6 +419,7 @@ def analyze_perplexity_vs_sequence_length(
     baseline_checkpoint: str,
     ltp_checkpoint: str,
     dynamic_tr_checkpoint: str,
+    hybrid_checkpoint: str,
     val_data: np.ndarray,
     sequence_lengths: List[int] = None,
     num_batches: int = 20,
@@ -361,6 +435,7 @@ def analyze_perplexity_vs_sequence_length(
         baseline_checkpoint: Path to baseline checkpoint
         ltp_checkpoint: Path to LTP checkpoint
         dynamic_tr_checkpoint: Path to Dynamic TR checkpoint
+        hybrid_checkpoint: Path to Hybrid checkpoint
         val_data: WikiText-2 validation data
         sequence_lengths: List of sequence lengths to test
         num_batches: Number of batches for evaluation
@@ -374,6 +449,7 @@ def analyze_perplexity_vs_sequence_length(
     baseline_perplexities = []
     ltp_perplexities = []
     dynamic_tr_perplexities = []
+    hybrid_perplexities = []
 
     print("Analyzing perplexity vs sequence length (trained models on WikiText-2)...")
 
@@ -381,6 +457,7 @@ def analyze_perplexity_vs_sequence_length(
     baseline_model = None
     ltp_model = None
     dynamic_tr_model = None
+    hybrid_model = None
 
     # Load Baseline model
     if os.path.exists(baseline_checkpoint):
@@ -430,6 +507,23 @@ def analyze_perplexity_vs_sequence_length(
         dynamic_tr_model.to(device)
         dynamic_tr_model.eval()
 
+    # Load Hybrid model
+    if os.path.exists(hybrid_checkpoint):
+        print("  Loading Hybrid model...")
+        hybrid_ckpt = torch.load(hybrid_checkpoint, map_location=device)
+        model_args = hybrid_ckpt.get('model_args', {})
+        hybrid_keys = {'n_layer', 'n_head', 'n_embd', 'block_size', 'bias',
+                       'vocab_size', 'dropout', 'reduction_layers', 'policy_hidden_dim',
+                       'lambda_tokens', 'rl_weight', 'ltp_layers', 'final_token_threshold',
+                       'temperature', 'masking_mode', 'lambda_factor', 'min_keep_tokens'}
+        filtered_args = {k: v for k, v in model_args.items()
+                         if k in hybrid_keys}
+        config = GPTConfigHybrid(**filtered_args)
+        hybrid_model = GPTHybrid(config)
+        hybrid_model.load_state_dict(hybrid_ckpt["model"])
+        hybrid_model.to(device)
+        hybrid_model.eval()
+
     # Evaluate each model on different sequence lengths
     for seq_len in sequence_lengths:
         print(f"  Evaluating sequence length: {seq_len}")
@@ -458,6 +552,14 @@ def analyze_perplexity_vs_sequence_length(
         else:
             dynamic_tr_perplexities.append(float('nan'))
 
+        # Hybrid
+        if hybrid_model is not None:
+            loss, ppl = evaluate_perplexity(
+                hybrid_model, val_data, num_batches, 8, seq_len, device)
+            hybrid_perplexities.append(ppl)
+        else:
+            hybrid_perplexities.append(float('nan'))
+
     # Create line plot
     fig, ax = plt.subplots(figsize=(10, 6))
 
@@ -467,7 +569,7 @@ def analyze_perplexity_vs_sequence_length(
         marker="o",
         linewidth=2,
         markersize=8,
-        label="Baseline GPT",
+        label="Baseline",
         color="#1f77b4",
     )
     ax.plot(
@@ -476,7 +578,7 @@ def analyze_perplexity_vs_sequence_length(
         marker="s",
         linewidth=2,
         markersize=8,
-        label="LTP (Learned Token Pruning)",
+        label="LTP",
         color="#2E86AB",
     )
     ax.plot(
@@ -485,8 +587,17 @@ def analyze_perplexity_vs_sequence_length(
         marker="^",
         linewidth=2,
         markersize=8,
-        label="Dynamic Token Reduction",
+        label="Dynamic TR",
         color="#A23B72",
+    )
+    ax.plot(
+        sequence_lengths,
+        hybrid_perplexities,
+        marker="D",
+        linewidth=2,
+        markersize=8,
+        label="Hybrid",
+        color="#F18F01",
     )
 
     ax.set_xlabel("Sequence Length", fontsize=12, fontweight="bold")
@@ -545,10 +656,12 @@ def plot_training_curves(
     show_plot: bool = False,
 ) -> None:
     """
-    Plot training curves (loss and perplexity) from checkpoint histories.
+    Plot training curves (loss and perplexity) from checkpoint histories for all four models:
+    Baseline GPT, LTP, Dynamic Token Reduction, and Hybrid.
 
     Args:
         checkpoint_paths: Dictionary mapping model names to checkpoint paths
+                         Expected keys: 'baseline', 'ltp', 'dynamic_tr', 'hybrid'
         save_dir: Directory to save plots (optional)
         show_plot: Whether to display the plots
     """
@@ -556,7 +669,8 @@ def plot_training_curves(
     model_labels = {
         'baseline': 'Baseline GPT',
         'ltp': 'LTP (Learned Token Pruning)',
-        'dynamic_tr': 'Dynamic Token Reduction'
+        'dynamic_tr': 'Dynamic Token Reduction',
+        'hybrid': 'Hybrid (Dynamic TR + LTP)'
     }
 
     # Load all histories
@@ -573,9 +687,10 @@ def plot_training_curves(
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
     colors = {
-        'baseline': '#2E86AB',
-        'ltp': '#A23B72',
-        'dynamic_tr': '#F18F01'
+        'baseline': '#1f77b4',
+        'ltp': '#2E86AB',
+        'dynamic_tr': '#A23B72',
+        'hybrid': '#F18F01'
     }
 
     # Plot 1: Training Loss vs Steps
@@ -590,7 +705,8 @@ def plot_training_curves(
 
     ax.set_xlabel("Training Steps", fontsize=12, fontweight="bold")
     ax.set_ylabel("Training Loss", fontsize=12, fontweight="bold")
-    ax.set_title("Training Loss vs Steps", fontsize=14, fontweight="bold")
+    ax.set_title("Training Loss vs Steps\n(Baseline, LTP, Dynamic TR, Hybrid)",
+                 fontsize=14, fontweight="bold")
     ax.legend(fontsize=10)
     ax.grid(alpha=0.3, linestyle="--")
 
@@ -606,11 +722,12 @@ def plot_training_curves(
 
     ax.set_xlabel("Training Steps", fontsize=12, fontweight="bold")
     ax.set_ylabel("Validation Loss", fontsize=12, fontweight="bold")
-    ax.set_title("Validation Loss vs Steps", fontsize=14, fontweight="bold")
+    ax.set_title("Validation Loss vs Steps\n(Baseline, LTP, Dynamic TR, Hybrid)",
+                 fontsize=14, fontweight="bold")
     ax.legend(fontsize=10)
     ax.grid(alpha=0.3, linestyle="--")
 
-    # Plot 3: Validation Perplexity vs Steps
+    # Plot 3: Perplexity vs Steps
     ax = axes[2]
     for model_name, history in histories.items():
         if history['val_perplexities']:
@@ -621,8 +738,8 @@ def plot_training_curves(
                     alpha=0.8, color=color, marker='o', markersize=4)
 
     ax.set_xlabel("Training Steps", fontsize=12, fontweight="bold")
-    ax.set_ylabel("Validation Perplexity", fontsize=12, fontweight="bold")
-    ax.set_title("Validation Perplexity vs Steps",
+    ax.set_ylabel("Perplexity", fontsize=12, fontweight="bold")
+    ax.set_title("Perplexity vs Steps\n(Baseline, LTP, Dynamic TR, Hybrid)",
                  fontsize=14, fontweight="bold")
     ax.legend(fontsize=10)
     ax.grid(alpha=0.3, linestyle="--")
@@ -673,7 +790,7 @@ def create_perplexity_line_plot(
         marker="o",
         linewidth=2,
         markersize=8,
-        label="LTP (Learned Token Pruning)",
+        label="LTP",
         color="#2E86AB",
     )
     ax.plot(
@@ -682,7 +799,7 @@ def create_perplexity_line_plot(
         marker="s",
         linewidth=2,
         markersize=8,
-        label="Dynamic Token Reduction",
+        label="Dynamic TR",
         color="#A23B72",
     )
 
@@ -733,21 +850,21 @@ def main():
         return
 
     # Define checkpoint paths
-    baseline_checkpoint = os.path.join(
-        project_root, "out-baseline-wt2", "baseline.pt")
+    baseline_checkpoint = os.path.join(project_root, "out-baseline-wt2", "baseline.pt")
     ltp_checkpoint = os.path.join(project_root, "out-ltp-wt2", "ltp_ckpt.pt")
-    dynamic_tr_checkpoint = os.path.join(
-        project_root, "out-dynamic-tr-wt2", "rl_ckpt.pt")
+    dynamic_tr_checkpoint = os.path.join(project_root, "out-dynamic-tr-wt2", "rl_ckpt.pt")
+    hybrid_checkpoint = os.path.join(project_root, "out-hybrid-wt2", "hybrid_ckpt.pt")
 
     # Compare models on WikiText-2 validation data
     print("=" * 60)
-    print("PERPLEXITY ANALYSIS: Baseline vs LTP vs Dynamic Token Reduction")
+    print("PERPLEXITY ANALYSIS: Baseline vs LTP vs Dynamic TR vs Hybrid")
     print("=" * 60)
 
     results = compare_models(
         baseline_checkpoint=baseline_checkpoint,
         ltp_checkpoint=ltp_checkpoint,
         dynamic_tr_checkpoint=dynamic_tr_checkpoint,
+        hybrid_checkpoint=hybrid_checkpoint,
         val_data=val_data,
         num_batches=50,
         device=device
@@ -775,13 +892,14 @@ def main():
         'baseline': baseline_checkpoint,
         'ltp': ltp_checkpoint,
         'dynamic_tr': dynamic_tr_checkpoint,
+        'hybrid': hybrid_checkpoint,
     }
 
-    # plot_training_curves(
-    #     checkpoint_paths=checkpoint_paths,
-    #     save_dir=output_dir,
-    #     show_plot=False
-    # )
+    plot_training_curves(
+        checkpoint_paths=checkpoint_paths,
+        save_dir=output_dir,
+        show_plot=False
+    )
 
     # Perplexity vs sequence length (trained models)
     print("\n--- Perplexity vs Sequence Length (Trained Models) ---")
@@ -791,6 +909,7 @@ def main():
         baseline_checkpoint=baseline_checkpoint,
         ltp_checkpoint=ltp_checkpoint,
         dynamic_tr_checkpoint=dynamic_tr_checkpoint,
+        hybrid_checkpoint=hybrid_checkpoint,
         val_data=val_data,
         sequence_lengths=[64, 128, 256, 512],
         num_batches=20,

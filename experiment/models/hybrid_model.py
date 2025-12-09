@@ -416,6 +416,8 @@ class GPTHybrid(nn.Module):
         targets: Optional[torch.Tensor] = None,
         use_token_reduction: bool = False,
         policy_training: bool = False,
+        ltp_masking_mode: Optional[str] = None,
+        ltp_temperature: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Dict]]:
         """
         Args:
@@ -423,6 +425,8 @@ class GPTHybrid(nn.Module):
             targets: (B, T) or None
             use_token_reduction: whether to use Dynamic TR (RL policies)
             policy_training: whether to sample actions for RL training
+            ltp_masking_mode: override for LTP masking mode ('soft' or 'hard')
+            ltp_temperature: override for LTP temperature (higher = softer pruning)
 
         Returns:
             logits: (B, T, vocab_size) or (B, 1, vocab_size)
@@ -460,18 +464,33 @@ class GPTHybrid(nn.Module):
         # LTP tracking
         total_pruning_loss = torch.tensor(0.0, device=device)
 
+        # Use override values if provided, otherwise use config
+        active_masking_mode = ltp_masking_mode if ltp_masking_mode is not None else self.config.masking_mode
+        active_temperature = ltp_temperature if ltp_temperature is not None else self.config.temperature
+
         # Forward through transformer blocks
         for layer_idx, block in enumerate(self.transformer.h):
 
             if layer_idx in self.config.ltp_layers:
-                # LTP block
+                # LTP block - use override parameters if provided
+                # Temporarily override block's temperature if specified
+                original_temp = None
+                if ltp_temperature is not None:
+                    original_temp = block.temperature
+                    block.temperature = ltp_temperature
+
                 x, attention_mask, pruning_loss = block(
                     x,
                     attention_mask=attention_mask,
                     protected_mask=protected_mask,
-                    masking_mode=self.config.masking_mode,
+                    masking_mode=active_masking_mode,
                     lambda_factor=self.config.lambda_factor,
                 )
+
+                # Restore original temperature
+                if original_temp is not None:
+                    block.temperature = original_temp
+
                 total_pruning_loss = total_pruning_loss + pruning_loss
 
                 # Update alive mask from attention_mask

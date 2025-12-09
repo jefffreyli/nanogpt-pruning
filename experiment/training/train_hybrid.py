@@ -352,7 +352,7 @@ raw_model = model.module if ddp else model
 # -----------------------------------------------------------------------------
 # Loss computation with RL
 # -----------------------------------------------------------------------------
-def compute_total_loss(lm_loss, rl_info, seq_len, raw_model, rl_stage=False):
+def compute_total_loss(lm_loss, rl_info, seq_len, raw_model, rl_stage=False, alpha_override=None):
     """
     Combine LM loss with RL policy gradient loss.
 
@@ -366,6 +366,7 @@ def compute_total_loss(lm_loss, rl_info, seq_len, raw_model, rl_stage=False):
         seq_len: Sequence length T
         raw_model: Model to get config from
         rl_stage: If True, we're in Stage 2 with frozen GPT2
+        alpha_override: If provided, use this instead of config rl_weight (for warmup)
     """
     policy_logprobs = rl_info["policy_logprobs"]
     num_selected_tokens = rl_info["num_selected_tokens"]
@@ -387,18 +388,31 @@ def compute_total_loss(lm_loss, rl_info, seq_len, raw_model, rl_stage=False):
     avg_frac = frac_selected.mean().item()
 
     lam = getattr(raw_model.config, "lambda_tokens", lambda_tokens)
-    alpha = getattr(raw_model.config, "rl_weight", rl_weight)
+    # Use override if provided (for warmup), otherwise use config
+    alpha = alpha_override if alpha_override is not None else getattr(
+        raw_model.config, "rl_weight", rl_weight)
 
     with torch.no_grad():
         base = -lm_loss.detach()
         base = base.expand_as(frac_selected)
         reward = base - lam * frac_selected
         reward = reward - reward.mean()
+
+        # Adaptive reward scaling based on actual pruning ratio
+        # When pruning is extreme, use tighter scaling to prevent large gradients
+        baseline_keep_ratio = 0.5  # Expected ~50% token retention
+        actual_keep_ratio = max(avg_frac, 0.01)  # Avoid division by zero
+        scaling_factor = min(actual_keep_ratio / baseline_keep_ratio, 1.0)
+
         # Normalize reward for stability
         reward_std = reward.std() + 1e-8
         reward = reward / reward_std
-        # Clamp reward to prevent extreme policy gradients
-        reward = torch.clamp(reward, -3.0, 3.0)
+
+        # Apply adaptive clipping based on pruning severity
+        # Tighter clipping when pruning is more aggressive
+        # At least 0.9, at most 3.0
+        clip_value = 3.0 * max(scaling_factor, 0.3)
+        reward = torch.clamp(reward, -clip_value, clip_value)
 
     policy_loss = -(reward * logp_total).mean()
 
@@ -547,13 +561,25 @@ while True:
             if rl_stage:
                 # Stage 2: use Dynamic TR with RL training
                 # Only policy params are trainable, GPT2+LTP are frozen
+                # Use softer LTP pruning during RL training for stability
+
+                # RL weight warmup: gradually increase RL loss weight over first N iterations
+                rl_warmup_steps = 100
+                if iter_num < rl_warmup_steps:
+                    current_rl_weight = rl_weight * \
+                        (iter_num + 1) / rl_warmup_steps
+                else:
+                    current_rl_weight = rl_weight
+
                 logits, lm_loss, rl_info = raw_model(
                     X, Y,
                     use_token_reduction=True,
                     policy_training=True,
+                    ltp_masking_mode='soft',  # Softer pruning for RL stability
+                    ltp_temperature=2.0,       # Higher temp = less aggressive pruning
                 )
                 total_loss, avg_frac_step = compute_total_loss(
-                    lm_loss, rl_info, X.size(1), raw_model, rl_stage=True)
+                    lm_loss, rl_info, X.size(1), raw_model, rl_stage=True, alpha_override=current_rl_weight)
                 avg_frac = avg_frac_step
                 loss = total_loss / gradient_accumulation_steps
             else:

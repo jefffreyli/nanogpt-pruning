@@ -29,7 +29,7 @@ bias = True
 # LTP-specific knobs (high-level)
 use_token_pruning = True
 pruning_temperature = 5.0    # temperature for soft pruning mask
-lambda_sparsity = 0.01        # sparsity regularization weight
+lambda_sparsity = 0.1        # sparsity regularization weight
 
 # how aggressively to protect the tail
 protected_tail_tokens = 128   # last 128 tokens never pruned
@@ -79,3 +79,6 @@ final_token_threshold = 0.01
 
 # Number of tail tokens that are never pruned (LM loss stability)
 min_keep_tokens = protected_tail_tokens
+
+freeze_base_weights = False
+

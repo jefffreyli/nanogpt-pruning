@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from experiment.models.ltp_model import GPTLTP, GPTConfigLTP
 
@@ -162,17 +163,43 @@ gptconf = GPTConfigLTP(**model_args)
 model = GPTLTP(gptconf)
 
 ckpt = torch.load("experiment/models/baseline_ckpt.pt", map_location=device)
-model.load_state_dict(ckpt["model"], strict=False)  # or strict=True if shapes match exactly
-
+model.load_state_dict(ckpt["model"], strict=False)
 
 if compile and device_type == "cuda":
     model = torch.compile(model)
+
 
 model.to(device)
 
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+    
+# --- NEW: optionally freeze all base weights except pruning thresholds ---
+freeze_base = getattr(cfg, "freeze_base_weights", False)
+
+# If using DDP later, we'll choose the correct raw_model below
+raw_model_for_freeze = model
+
+# If you wrap with DDP *before* this block, do:
+# raw_model_for_freeze = model.module if isinstance(model, DDP) else model
+
+if freeze_base:
+    print("Freezing all parameters except LTP thresholds...")
+    trainable = []
+    frozen = []
+    for name, param in raw_model_for_freeze.named_parameters():
+        if "threshold" in name:
+            param.requires_grad = True
+            trainable.append(name)
+        else:
+            param.requires_grad = False
+            frozen.append(name)
+    print(f"Trainable parameters (should be only thresholds):")
+    for n in trainable:
+        print("  ", n)
+    print(f"Frozen parameters count: {len(frozen)}")
+# --- END NEW ---
 # optimizer ------------------------------------------------------------------
 
 raw_model = model.module if ddp else model
